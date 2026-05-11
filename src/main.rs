@@ -42,11 +42,13 @@ async fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0);
+    // Default 1 worker: with 0.4 CPU, a second worker adds context-switch
+    // overhead without meaningful throughput gain. Override with WORKERS env.
     let workers = env::var("WORKERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or_else(|| num_cpus::get().min(2));
+        .unwrap_or(1);
 
     let loaded_index = IvfIndex::load(std::path::Path::new(&index_path))
         .with_context(|| format!("falha ao carregar índice em {index_path}"))
@@ -65,6 +67,11 @@ async fn main() -> std::io::Result<()> {
             .with_context(|| format!("falha ao carregar mcc_risk em {mcc_risk_path}"))
             .map_err(to_io_error)?,
     );
+
+    // Warm-up: run synthetic queries to pre-populate CPU caches (L3, TLB,
+    // branch predictor) before accepting real traffic. Uses a simple LCG so
+    // there's no dependency on the rand crate here.
+    warmup_index(&index, 200);
 
     READY.store(true, Ordering::Release);
 
@@ -111,4 +118,19 @@ fn init_tracing() -> anyhow::Result<()> {
 fn to_io_error(err: anyhow::Error) -> std::io::Error {
     warn!(error = %err, "startup failure");
     std::io::Error::other(err.to_string())
+}
+
+/// Runs `count` synthetic queries against the index to warm CPU caches before
+/// the server starts accepting requests. Uses a plain LCG — no crate needed.
+fn warmup_index(index: &index::IvfIndex, count: usize) {
+    let mut state = 0x12345678u32;
+    for _ in 0..count {
+        let query: [f32; 14] = std::array::from_fn(|i| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let x = (state ^ (state >> 16)) as f32 / u32::MAX as f32;
+            // dims 5 and 6 are sentinel when no last_transaction
+            if i == 5 || i == 6 { -1.0 } else { x }
+        });
+        let _ = index.fraud_score(&query);
+    }
 }

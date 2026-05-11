@@ -1,28 +1,44 @@
 use actix_web::{HttpResponse, web};
+use actix_web::http::header;
 
-use crate::models::{FraudDecision, TransactionPayload};
+use crate::models::TransactionPayload;
 use crate::vectorizer::vectorize;
 use crate::AppState;
 
+// Pre-rendered JSON responses for all 6 possible fraud decisions.
+// fraud_score ∈ {0/5, 1/5, 2/5, 3/5, 4/5, 5/5} = {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}.
+// approved = score < 0.6  →  indices 0,1,2 → approved:true; 3,4,5 → approved:false.
+static RESPONSES: [&[u8]; 6] = [
+    br#"{"approved":true,"fraud_score":0.0}"#,
+    br#"{"approved":true,"fraud_score":0.2}"#,
+    br#"{"approved":true,"fraud_score":0.4}"#,
+    br#"{"approved":false,"fraud_score":0.6}"#,
+    br#"{"approved":false,"fraud_score":0.8}"#,
+    br#"{"approved":false,"fraud_score":1.0}"#,
+];
+
 /// Fraud scoring endpoint.
 ///
-/// Any internal failure must degrade to `FraudDecision::safe_default()` with HTTP 200.
+/// Any internal failure must degrade to `RESPONSES[0]` (approved:true, score:0.0)
+/// with HTTP 200. FP costs 1pt; HTTP 500 costs 5pt — safe_default always wins.
 pub async fn fraud_score_handler(
     state: web::Data<AppState>,
     payload: web::Json<TransactionPayload>,
 ) -> HttpResponse {
     let query = vectorize(&payload, &state.mcc_risk);
     let score = state.index.fraud_score(&query);
-    let decision = if score.is_finite() {
-        FraudDecision {
-            approved: score < 0.6,
-            fraud_score: score,
-        }
+
+    // Map score ∈ {0.0,0.2,0.4,0.6,0.8,1.0} → index 0..5.
+    // Non-finite (NaN/Inf) → index 0 (safe default: approved=true, score=0.0).
+    let idx = if score.is_finite() {
+        ((score * 5.0).round() as usize).min(5)
     } else {
-        FraudDecision::safe_default()
+        0
     };
 
-    HttpResponse::Ok().json(decision)
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, "application/json"))
+        .body(actix_web::web::Bytes::from_static(RESPONSES[idx]))
 }
 
 #[cfg(test)]

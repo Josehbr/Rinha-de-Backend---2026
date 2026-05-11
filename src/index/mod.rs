@@ -14,7 +14,8 @@ use memmap2::{Mmap, MmapOptions};
 use crate::index::layout::{BLOCK_SIZE, IndexLayout, N_DIMS};
 use crate::index::quantize::quantize_query;
 use crate::index::search::{
-    DistF32, find_nearest_clusters, find_nearest_clusters_inplace, update_top_k_blocks,
+    DistF32, Top5, find_nearest_clusters, find_nearest_clusters_inplace, update_top_k_blocks,
+    update_top5_blocks,
 };
 
 /// Encapsulates the mmap'd IVF index and provides a safe, thread-safe search API.
@@ -39,8 +40,9 @@ impl IvfIndex {
         let file = File::open(path)
             .with_context(|| format!("falha ao abrir index.bin em {}", path.display()))?;
 
-        // Read-only mmap. The kernel can share these pages between API processes.
-        let mmap = unsafe { MmapOptions::new().map(&file) }
+        // Read-only mmap with MAP_POPULATE: pre-faults all pages on load so the
+        // first requests don't pay page-fault latency. Adds ~1s to startup time.
+        let mmap = unsafe { MmapOptions::new().populate().map(&file) }
             .with_context(|| format!("falha ao fazer mmap de {}", path.display()))?;
 
         let parsed_layout = IndexLayout::from_bytes(&mmap)
@@ -66,14 +68,23 @@ impl IvfIndex {
     }
 
     /// Returns the global top-k `(distance, label)` across probed IVF clusters.
+    ///
+    /// Uses `Top5` internally (always probes for 5 neighbours) and truncates to `k`.
+    /// k > 5 falls back to the BinaryHeap path for correctness.
     pub fn search_knn(&self, query: &[f32; N_DIMS], k: usize) -> Vec<(DistF32, u8)> {
         if k == 0 {
             return Vec::new();
         }
 
+        if k <= 5 {
+            let mut top5 = Top5::new();
+            self.fill_top5(query, self.nprobe, &mut top5);
+            return top5.iter().take(k).map(|&(d, l)| (DistF32(d), l)).collect();
+        }
+
+        // Fallback for k > 5 (not used in production, correctness path for tests).
         let mut heap: BinaryHeap<(DistF32, u8)> = BinaryHeap::with_capacity(k + 1);
         self.fill_top_k_heap(query, k, self.nprobe, &mut heap);
-
         let mut out: Vec<(DistF32, u8)> = heap.into_iter().collect();
         out.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         out
@@ -84,16 +95,18 @@ impl IvfIndex {
     /// Two-stage strategy: fast probe (nprobe clusters) first, then a full probe
     /// (full_nprobe) only when the initial count lands in the ambiguous zone {2, 3}
     /// where a single wrong vote flips the fraud decision.
+    ///
+    /// Uses `Top5` (sorted array) instead of `BinaryHeap` to avoid heap overhead.
     pub fn fraud_score(&self, query: &[f32; N_DIMS]) -> f32 {
-        let mut heap: BinaryHeap<(DistF32, u8)> = BinaryHeap::with_capacity(6);
+        let mut top5 = Top5::new();
 
-        self.fill_top_k_heap(query, 5, self.nprobe, &mut heap);
-        let fast_frauds = heap.iter().filter(|(_, label)| *label == 1).count();
+        self.fill_top5(query, self.nprobe, &mut top5);
+        let fast_frauds = top5.count_fraud();
 
         let frauds = if fast_frauds == 2 || fast_frauds == 3 {
-            heap.clear();
-            self.fill_top_k_heap(query, 5, self.full_nprobe, &mut heap);
-            heap.iter().filter(|(_, label)| *label == 1).count()
+            top5.clear();
+            self.fill_top5(query, self.full_nprobe, &mut top5);
+            top5.count_fraud()
         } else {
             fast_frauds
         };
@@ -115,6 +128,46 @@ impl IvfIndex {
             self.full_nprobe = full.min(max_clusters);
         }
         self
+    }
+
+    /// Hot-path: fills `top5` using `update_top5_blocks` (array, no heap).
+    fn fill_top5(&self, query: &[f32; N_DIMS], nprobe: usize, top5: &mut Top5) {
+        if nprobe == 0 {
+            return;
+        }
+
+        let query_i16 = quantize_query(query);
+
+        let dispatch = |cluster_id: usize, top5: &mut Top5| {
+            let Some((bs, be)) = self.cluster_block_range(cluster_id) else {
+                return;
+            };
+            if bs >= be {
+                return;
+            }
+            let blocks = &self.layout.blocks[bs..be];
+            let labels = &self.layout.labels[bs * BLOCK_SIZE..be * BLOCK_SIZE];
+            update_top5_blocks(&query_i16, blocks, labels, top5);
+        };
+
+        if nprobe <= MAX_NPROBE {
+            let mut cluster_ids = [0usize; MAX_NPROBE];
+            let mut cluster_dists = [0.0f32; MAX_NPROBE];
+            let used = find_nearest_clusters_inplace(
+                query,
+                self.layout.centroids,
+                nprobe,
+                &mut cluster_ids,
+                &mut cluster_dists,
+            );
+            for &cid in &cluster_ids[..used] {
+                dispatch(cid, top5);
+            }
+        } else {
+            for cid in find_nearest_clusters(query, self.layout.centroids, nprobe) {
+                dispatch(cid, top5);
+            }
+        }
     }
 
     fn cluster_block_range(&self, cluster_id: usize) -> Option<(usize, usize)> {

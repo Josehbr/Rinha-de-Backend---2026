@@ -191,7 +191,9 @@ mod tests {
         let total        = labels_start + n_padded;
 
         // Use VectorBlock as backing to guarantee 32-byte alignment.
-        let n_vb = align_up(total, size_of::<VectorBlock>()) / size_of::<VectorBlock>();
+        // Ceiling division: n_vb = ceil(total / sizeof(VectorBlock)).
+        // align_up requires power-of-2 but sizeof(VectorBlock)=224 is not; use division.
+        let n_vb = (total + size_of::<VectorBlock>() - 1) / size_of::<VectorBlock>();
         let mut backing: Vec<VectorBlock> = vec![VectorBlock::default(); n_vb];
 
         {

@@ -23,12 +23,15 @@ pub fn scan_block_scalar(query_i16: &[i16; N_DIMS], block: &VectorBlock) -> [f32
 /// AVX2 block scan: computes L2² distances from `query_i16` to all BLOCK_SIZE
 /// vectors in `block` simultaneously, using 256-bit FMA instructions.
 ///
+/// Uses 4 independent accumulators to hide Haswell's 5-cycle FMA latency
+/// (throughput 1/cycle). Each accumulator handles every 4th dimension, so
+/// there are 3 independent FMAs between consecutive writes to the same acc.
+///
 /// Early exit: after processing the first 8 dimensions, if ALL 8 partial
 /// distances already exceed `threshold`, returns `[f32::MAX; 8]` — the remaining
-/// 6 dimensions can only increase the distances, so none of the 8 vectors can
-/// enter the top-k heap.
+/// 6 dimensions can only increase distances.
 ///
-/// Accumulation is in f32 to avoid i32 overflow: 14 × (20_000)² = 5.6×10⁹ > i32::MAX.
+/// Accumulation in f32: 14 × (20_000)² = 5.6×10⁹ > i32::MAX, needs f32.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn scan_block_avx2(
@@ -38,43 +41,46 @@ unsafe fn scan_block_avx2(
 ) -> [f32; BLOCK_SIZE] {
     use std::arch::x86_64::*;
 
-    // SAFETY: caller guarantees avx2+fma available (target_feature). All pointer
-    // arithmetic stays within the 112-element `data` array.
+    // SAFETY: caller guarantees avx2+fma available. All pointer arithmetic
+    // stays within the 112-element `data` array (N_DIMS × BLOCK_SIZE = 14 × 8).
     unsafe {
-        let mut acc = _mm256_setzero_ps();
+        // 4 independent accumulators to break FMA dependency chain.
+        // acc0 ← dims 0,4,8,12  acc1 ← dims 1,5,9,13
+        // acc2 ← dims 2,6,10    acc3 ← dims 3,7,11
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
 
-        // Process first 8 dims, then check early exit.
-        for d in 0..8usize {
-            let q_f32 = _mm256_set1_ps(query_i16[d] as f32);
-            // Load 8 × i16 for this dimension (128-bit, one slot per lane).
-            let raw = _mm_loadu_si128(
-                block.data.as_ptr().add(d * BLOCK_SIZE) as *const __m128i,
-            );
-            // Sign-extend i16 → i32 → f32 for FMA (avoids i32 overflow at 14×20000²).
-            let b_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(raw));
-            let diff = _mm256_sub_ps(b_f32, q_f32);
-            acc = _mm256_fmadd_ps(diff, diff, acc);
+        // Inline macro to avoid repeating load/extend/sub/fma for each dim.
+        macro_rules! acc_dim {
+            ($acc:expr, $d:expr) => {{
+                let q = _mm256_set1_ps(query_i16[$d] as f32);
+                let raw = _mm_loadu_si128(
+                    block.data.as_ptr().add($d * BLOCK_SIZE) as *const __m128i,
+                );
+                let b = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(raw));
+                let diff = _mm256_sub_ps(b, q);
+                $acc = _mm256_fmadd_ps(diff, diff, $acc);
+            }};
         }
 
-        // Early exit: if all 8 partial sums already exceed threshold, skip dims 8..14.
-        // Distances are monotonically non-decreasing as more dims are added.
+        // First 8 dims: rotate through 4 accumulators (dims 0-3 then 4-7).
+        acc_dim!(acc0, 0); acc_dim!(acc1, 1); acc_dim!(acc2, 2); acc_dim!(acc3, 3);
+        acc_dim!(acc0, 4); acc_dim!(acc1, 5); acc_dim!(acc2, 6); acc_dim!(acc3, 7);
+
+        // Early exit on partial sum of all 4 accumulators.
+        let partial = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
         let thresh_v = _mm256_set1_ps(threshold);
-        let above = _mm256_cmp_ps(acc, thresh_v, _CMP_GT_OS);
-        if _mm256_movemask_ps(above) == 0xFF {
+        if _mm256_movemask_ps(_mm256_cmp_ps(partial, thresh_v, _CMP_GT_OS)) == 0xFF {
             return [f32::MAX; BLOCK_SIZE];
         }
 
-        // Process remaining dims 8..14.
-        for d in 8..N_DIMS {
-            let q_f32 = _mm256_set1_ps(query_i16[d] as f32);
-            let raw = _mm_loadu_si128(
-                block.data.as_ptr().add(d * BLOCK_SIZE) as *const __m128i,
-            );
-            let b_f32 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(raw));
-            let diff = _mm256_sub_ps(b_f32, q_f32);
-            acc = _mm256_fmadd_ps(diff, diff, acc);
-        }
+        // Remaining 6 dims: 8..14 (acc2 and acc3 get one fewer dim each).
+        acc_dim!(acc0, 8); acc_dim!(acc1,  9); acc_dim!(acc2, 10); acc_dim!(acc3, 11);
+        acc_dim!(acc0, 12); acc_dim!(acc1, 13);
 
+        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
         let mut out = [0.0f32; BLOCK_SIZE];
         _mm256_storeu_ps(out.as_mut_ptr(), acc);
         out

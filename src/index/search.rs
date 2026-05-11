@@ -3,6 +3,74 @@ use std::collections::BinaryHeap;
 use crate::index::layout::{BLOCK_SIZE, N_DIMS, VectorBlock};
 use crate::index::simd::scan_block;
 
+// ── Top5 ──────────────────────────────────────────────────────────────────────
+
+/// Fixed-capacity top-k buffer for k=5, sorted ascending by distance.
+///
+/// Replaces `BinaryHeap<(DistF32, u8)>` on the hot path. k=5 is so small that
+/// an insertion-sorted array beats the heap: no allocations, no indirection,
+/// and all data fits in a single cache line (5 × 5B ≈ 40B).
+pub struct Top5 {
+    /// (distance, label) pairs, sorted ascending (nearest first).
+    data: [(f32, u8); 5],
+    pub len: usize,
+}
+
+impl Top5 {
+    #[inline]
+    pub fn new() -> Self {
+        Self { data: [(f32::MAX, 0); 5], len: 0 }
+    }
+
+    /// Distance of the worst (farthest) element, or f32::MAX when not full.
+    #[inline]
+    pub fn worst(&self) -> f32 {
+        if self.len < 5 { f32::MAX } else { self.data[4].0 }
+    }
+
+    /// Insert `(dist, label)` if it improves the current top-5.
+    #[inline]
+    pub fn try_insert(&mut self, dist: f32, label: u8) {
+        if self.len < 5 {
+            // Find insertion point (ascending order).
+            let mut pos = self.len;
+            while pos > 0 && self.data[pos - 1].0 > dist {
+                pos -= 1;
+            }
+            for i in (pos..self.len).rev() {
+                self.data[i + 1] = self.data[i];
+            }
+            self.data[pos] = (dist, label);
+            self.len += 1;
+        } else if dist < self.data[4].0 {
+            // Evict worst, find insertion point among first 4.
+            let mut pos = 4;
+            while pos > 0 && self.data[pos - 1].0 > dist {
+                pos -= 1;
+            }
+            for i in (pos..4).rev() {
+                self.data[i + 1] = self.data[i];
+            }
+            self.data[pos] = (dist, label);
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Number of fraud labels (label=1) among the current top-k items.
+    #[inline]
+    pub fn count_fraud(&self) -> usize {
+        self.data[..self.len].iter().filter(|&&(_, l)| l == 1).count()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &(f32, u8)> {
+        self.data[..self.len].iter()
+    }
+}
+
 // ── DistF32 ───────────────────────────────────────────────────────────────────
 
 /// Wrapper for non-NaN f32 that implements `Ord`, enabling use as a `BinaryHeap` key.
@@ -186,6 +254,39 @@ fn sort_by_dist(indices: &mut [usize], dists: &mut [f32], len: usize) {
     }
 }
 
+// ── Hot-path block scan (uses Top5) ──────────────────────────────────────────
+
+/// Scans VectorBlocks for the hot path, updating `top5` in place.
+///
+/// Uses `Top5` instead of `BinaryHeap` to avoid heap overhead for k=5.
+/// `update_top_k_blocks` (BinaryHeap) is kept for `search_knn` and tests.
+pub fn update_top5_blocks(
+    query_i16: &[i16; N_DIMS],
+    blocks: &[VectorBlock],
+    labels: &[u8],
+    top5: &mut Top5,
+) {
+    let mut threshold = top5.worst();
+
+    for (b_idx, block) in blocks.iter().enumerate() {
+        let dists = scan_block(query_i16, block, threshold);
+
+        for slot in 0..BLOCK_SIZE {
+            let vec_idx = b_idx * BLOCK_SIZE + slot;
+            if vec_idx >= labels.len() {
+                break;
+            }
+            let d = dists[slot];
+            if d == f32::MAX {
+                continue;
+            }
+            top5.try_insert(d, labels[vec_idx]);
+        }
+
+        threshold = top5.worst();
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -338,13 +439,16 @@ mod tests {
             }).collect()
         }).collect();
 
-        // Brute-force ground truth using scan_block_scalar
+        // Brute-force ground truth.
+        // Use scan_block (AVX2 when available) to match the precision of the IVF
+        // search path exactly — comparing scalar vs AVX2 distances causes false
+        // mismatches on ties when the accumulation order differs.
         let brute_force_top5 = |query: &[i16; N_DIMS]| -> Vec<(DistF32, u8)> {
-            use crate::index::simd::scan_block_scalar;
+            use crate::index::simd::scan_block;
             let mut heap: BinaryHeap<(DistF32, u8)> = BinaryHeap::new();
             for ci in 0..nlist {
                 for (b_idx, block) in cluster_blocks[ci].iter().enumerate() {
-                    let dists = scan_block_scalar(query, block);
+                    let dists = scan_block(query, block, f32::MAX);
                     for slot in 0..BLOCK_SIZE {
                         let vi = b_idx * BLOCK_SIZE + slot;
                         if vi >= cluster_labs[ci].len() { break; }
