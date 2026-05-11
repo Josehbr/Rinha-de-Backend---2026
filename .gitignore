@@ -10,6 +10,8 @@ test/test-data.json
 test/results*.json
 benchmarks/*.json
 benchmarks/*.log
+benchmarks/*.tsv
+benchmarks/.last-seen-issue
 
 # Arquivos temporários de debug (overlays locais, não fazem parte da submissão)
 docker-compose.bypass.yml

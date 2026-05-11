@@ -20,8 +20,10 @@ use index::quantize::quantize_i16;
 
 const INPUT_PATH: &str = "resources/references.json.gz";
 const OUTPUT_PATH: &str = "index.bin";
-const NLIST: usize = 4096;
-const NPROBE: u32 = 8;
+/// NLIST=8192: clusters menores (366 vec/cluster) → working set
+/// 24×10.3 KB ≈ 247 KB **cabe em L2 (256 KB) do Haswell**.
+const NLIST: usize = 8192;
+const NPROBE: u32 = 24;
 const NITER: usize = 30;
 const LOG_EVERY: usize = 500_000;
 

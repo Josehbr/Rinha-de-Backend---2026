@@ -97,11 +97,6 @@ pub fn find_nearest_clusters_inplace(
 /// `labels`: label per vector slot, length = blocks.len() × BLOCK_SIZE.
 /// `k`: heap capacity.
 /// `heap`: shared heap across probed clusters — avoids per-cluster allocations.
-///
-/// **Prefetch**: each iteration issues `_mm_prefetch` 2 blocks ahead. Each
-/// block is 224 bytes (i16 layout), so 2 blocks ≈ 7 cache lines — well within
-/// Haswell's L1 hardware prefetcher capacity. Hides L3/DRAM latency on Haswell
-/// where the NPROBE×cluster working set spills past L2 (256 KB).
 pub fn update_top_k_blocks(
     query_i16: &[i16; N_DIMS],
     blocks: &[VectorBlock],
@@ -115,24 +110,7 @@ pub fn update_top_k_blocks(
         f32::MAX
     };
 
-    const PREFETCH_DISTANCE: usize = 2;
-
     for (b_idx, block) in blocks.iter().enumerate() {
-        // Prefetch a few blocks ahead so the L1 has them ready by the time
-        // scan_block() touches them. Only valid on x86_64 with SSE present
-        // (granted by x86-64-v3 baseline). No-op if the pointer is past the end.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let next = b_idx + PREFETCH_DISTANCE;
-            if next < blocks.len() {
-                _mm_prefetch(
-                    blocks.as_ptr().add(next) as *const i8,
-                    _MM_HINT_T0,
-                );
-            }
-        }
-
         let dists = scan_block(query_i16, block, threshold);
 
         for slot in 0..BLOCK_SIZE {
@@ -214,7 +192,7 @@ fn sort_by_dist(indices: &mut [usize], dists: &mut [f32], len: usize) {
 mod tests {
     use super::*;
     use crate::index::kmeans::kmeans;
-    use crate::index::quantize::quantize_query;
+    use crate::index::quantize::{quantize_i16, quantize_query};
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
