@@ -12,39 +12,37 @@ name = "build-index"
 path = "src/bin/build_index.rs"
 
 [dependencies]
-# HTTP server — mais rápido em benchmarks TechEmpower
-actix-web = { version = "4", features = ["macros"] }
-actix-rt = "2"
+# HTTP runtime — thread-per-core io_uring (falls back to legacy/epoll)
+monoio = { version = "0.2.4", features = ["iouring", "legacy", "macros"] }
+
+# Lightweight HTTP/1.1 request parser (zero-copy, zero alloc)
+httparse = "1.10.1"
 
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# gzip para descompactar references.json.gz
+# gzip para descompactar references.json.gz (build-index only)
 flate2 = "1"
 
-# Paralelismo controlado
+# Paralelismo para k-means (build-index only)
 rayon = "1"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Utilitários
+# Error handling
 anyhow = "1"
-bytes = "1"
 
 # Zero-copy byte casting para layout binário do índice
 bytemuck = { version = "1", features = ["derive"] }
 
-# RNG para K-means++ initialização
+# RNG para K-means++ initialização (build-index only)
 rand = "0.9"
 
 # mmap read-only compartilhado entre as duas instâncias de API
 memmap2 = "0.9"
-
-# Número de CPUs lógicas para configurar workers do Actix
-num_cpus = "1"
 
 [profile.release]
 opt-level = 3

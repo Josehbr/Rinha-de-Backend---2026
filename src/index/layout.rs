@@ -174,9 +174,12 @@ mod tests {
         assert_eq!(size_of::<IndexHeader>() % 32, 0);
     }
 
-    /// Builds a minimal valid index.bin buffer using VectorBlock as backing
-    /// to guarantee 32-byte alignment required by `bytemuck::try_cast_slice`.
-    fn build_test_index(nlist: u32, n_per_cluster: u32) -> Vec<u8> {
+    /// Builds a minimal valid index.bin buffer backed by `Vec<VectorBlock>` to
+    /// guarantee the 32-byte alignment required by `bytemuck::try_cast_slice`.
+    ///
+    /// Returns the VectorBlock-aligned backing and the number of valid bytes.
+    /// Callers should use `bytemuck::cast_slice(&backing)[..total]`.
+    fn build_test_index(nlist: u32, n_per_cluster: u32) -> (Vec<VectorBlock>, usize) {
         assert_eq!(n_per_cluster % BLOCK_SIZE as u32, 0, "n_per_cluster must be multiple of BLOCK_SIZE");
         let n_padded = nlist as usize * n_per_cluster as usize;
         let n_blocks = n_padded / BLOCK_SIZE;
@@ -190,9 +193,8 @@ mod tests {
         let labels_start = blocks_start + blocks_sz;
         let total        = labels_start + n_padded;
 
-        // Use VectorBlock as backing to guarantee 32-byte alignment.
-        // Ceiling division: n_vb = ceil(total / sizeof(VectorBlock)).
-        // align_up requires power-of-2 but sizeof(VectorBlock)=224 is not; use division.
+        // Ceiling division to find minimum VectorBlocks needed to hold `total` bytes.
+        // sizeof(VectorBlock)=224 is not a power-of-2, so align_up can't be used here.
         let n_vb = (total + size_of::<VectorBlock>() - 1) / size_of::<VectorBlock>();
         let mut backing: Vec<VectorBlock> = vec![VectorBlock::default(); n_vb];
 
@@ -221,13 +223,14 @@ mod tests {
             }
         }
 
-        bytemuck::cast_slice::<VectorBlock, u8>(&backing)[..total].to_vec()
+        (backing, total)
     }
 
     #[test]
     fn round_trip_index_layout() {
-        let buf = build_test_index(4, 8); // 4 clusters × 8 vectors each = 32 total
-        let layout = IndexLayout::from_bytes(&buf).unwrap();
+        let (backing, total) = build_test_index(4, 8); // 4 clusters × 8 vectors = 32 total
+        let raw = bytemuck::cast_slice::<VectorBlock, u8>(&backing);
+        let layout = IndexLayout::from_bytes(&raw[..total]).unwrap();
 
         assert_eq!(layout.header.magic,        MAGIC);
         assert_eq!(layout.header.version,      VERSION);
@@ -249,19 +252,27 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_bad_magic() {
-        let mut buf = build_test_index(1, 8);
-        buf[0] = 0xFF;
-        buf[1] = 0xFF;
-        let err = IndexLayout::from_bytes(&buf).unwrap_err();
+        let (mut backing, total) = build_test_index(1, 8);
+        {
+            let buf: &mut [u8] = bytemuck::cast_slice_mut(&mut backing);
+            buf[0] = 0xFF;
+            buf[1] = 0xFF;
+        }
+        let raw = bytemuck::cast_slice::<VectorBlock, u8>(&backing);
+        let err = IndexLayout::from_bytes(&raw[..total]).unwrap_err();
         assert!(err.to_string().contains("invalid magic"), "{err}");
     }
 
     #[test]
     fn from_bytes_rejects_wrong_version() {
-        let mut buf = build_test_index(1, 8);
-        let v_bytes = 99u32.to_le_bytes();
-        buf[4..8].copy_from_slice(&v_bytes);
-        let err = IndexLayout::from_bytes(&buf).unwrap_err();
+        let (mut backing, total) = build_test_index(1, 8);
+        {
+            let buf: &mut [u8] = bytemuck::cast_slice_mut(&mut backing);
+            let v_bytes = 99u32.to_le_bytes();
+            buf[4..8].copy_from_slice(&v_bytes);
+        }
+        let raw = bytemuck::cast_slice::<VectorBlock, u8>(&backing);
+        let err = IndexLayout::from_bytes(&raw[..total]).unwrap_err();
         assert!(err.to_string().contains("unsupported index version"), "{err}");
     }
 
