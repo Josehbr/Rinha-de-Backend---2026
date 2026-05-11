@@ -18,7 +18,7 @@ services:
           memory: "20MB"
 
   api1:
-    image: josehbr/fraud-api:v5
+    image: josehbr/fraud-api:v1
     restart: on-failure
     volumes:
       - sockets:/sockets
@@ -27,7 +27,7 @@ services:
       - BIND_UDS=/sockets/api1.sock
       - NPROBE=24
       - FULL_NPROBE=72
-      - WORKERS=1
+      - WORKERS=2
     healthcheck:
       test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api1.sock"]
       interval: 5s
@@ -41,7 +41,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: josehbr/fraud-api:v5
+    image: josehbr/fraud-api:v1
     restart: on-failure
     volumes:
       - sockets:/sockets
@@ -50,7 +50,7 @@ services:
       - BIND_UDS=/sockets/api2.sock
       - NPROBE=24
       - FULL_NPROBE=72
-      - WORKERS=1
+      - WORKERS=2
     healthcheck:
       test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api2.sock"]
       interval: 5s
