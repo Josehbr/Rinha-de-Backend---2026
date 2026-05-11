@@ -1,0 +1,26 @@
+# Build artefacts
+/target
+*.bin
+
+# Dataset/índice grandes (gerados em build/baixados)
+resources/references.json.gz
+test/test-data.json
+
+# Outputs de benchmark (k6 + diagnose-errors.mjs)
+test/results*.json
+benchmarks/*.json
+benchmarks/*.log
+
+# Arquivos temporários de debug (overlays locais, não fazem parte da submissão)
+docker-compose.bypass.yml
+test/test-bypass.js
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
