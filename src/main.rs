@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Context;
 use index::IvfIndex;
 use models::MccRisk;
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
@@ -45,7 +45,7 @@ static HTTP_404: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 fn main() {
     init_tracing();
 
-    let index_path   = env::var("INDEX_PATH").unwrap_or_else(|_| "./index.bin".into());
+    let index_path    = env::var("INDEX_PATH").unwrap_or_else(|_| "./index.bin".into());
     let mcc_risk_path = env::var("MCC_RISK_PATH")
         .unwrap_or_else(|_| "./resources/mcc_risk.json".into());
 
@@ -75,20 +75,14 @@ fn main() {
 
     let state = Arc::new(AppState { index, mcc_risk });
 
-    // Try io_uring; fall back to legacy (epoll) for kernels < 5.6.
-    let rt_uring = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .with_entries(1024)
-        .build();
+    // Single-threaded tokio: no context-switch overhead between tasks.
+    // With 0.4 CPU, one thread handles all async I/O cooperatively.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("falha ao criar tokio runtime");
 
-    match rt_uring {
-        Ok(mut rt) => rt.block_on(server_loop(state)),
-        Err(_) => {
-            let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
-                .build()
-                .expect("falha ao criar runtime legacy");
-            rt.block_on(server_loop(state));
-        }
-    }
+    rt.block_on(server_loop(state));
 }
 
 // ── Server accept loop ────────────────────────────────────────────────────────
@@ -100,7 +94,8 @@ async fn server_loop(state: Arc<AppState>) {
     });
 
     let _ = std::fs::remove_file(&uds_path);
-    let listener = UnixListener::bind(&uds_path).expect("falha ao bind UDS");
+    let listener = UnixListener::bind(&uds_path)
+        .unwrap_or_else(|e| panic!("falha ao bind {uds_path}: {e}"));
 
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(
@@ -112,9 +107,7 @@ async fn server_loop(state: Arc<AppState>) {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let state = state.clone();
-                monoio::spawn(async move {
-                    handle_conn(stream, state).await;
-                });
+                tokio::spawn(handle_conn(stream, state));
             }
             Err(e) => warn!("accept error: {e}"),
         }
@@ -124,41 +117,37 @@ async fn server_loop(state: Arc<AppState>) {
 // ── Per-connection keepalive handler ──────────────────────────────────────────
 
 async fn handle_conn(mut stream: UnixStream, state: Arc<AppState>) {
-    // One 8-KB scratch buffer per connection, reused across requests.
-    // nginx sends one request at a time on keepalive connections, so the
-    // buffer is cleared between requests.
     let mut accum: Vec<u8> = Vec::with_capacity(4096);
 
     loop {
         accum.clear();
 
-        // ── Accumulate a complete request ──────────────────────────────────
+        // ── Accumulate complete request ────────────────────────────────────
         let (header_end, content_length, is_close) = loop {
-            // Read next chunk into an owned Vec (monoio completion model).
-            let chunk = vec![0u8; 4096usize.saturating_sub(accum.len()).max(512)];
-            let (res, chunk) = stream.read(chunk).await;
-            let n = match res {
-                Ok(0) | Err(_) => return, // peer closed or error
+            let mut chunk = vec![0u8; 4096usize.saturating_sub(accum.len()).max(512)];
+            let n = match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
                 Ok(n) => n,
             };
             accum.extend_from_slice(&chunk[..n]);
 
             match parse_head(&accum) {
                 Some(x) => break x,
-                None if accum.len() > 8192 => return, // protect against runaway
+                None if accum.len() > 8192 => return,
                 None => continue,
             }
         };
 
-        // ── Read remaining body bytes if any ──────────────────────────────
-        let body_start = header_end + 4; // skip past \r\n\r\n
+        // ── Read remaining body bytes ──────────────────────────────────────
+        // httparse Status::Complete(n) already includes the \r\n\r\n separator,
+        // so body starts at header_end (not header_end + 4).
+        let body_start = header_end;
         let body_end   = body_start + content_length;
 
         while accum.len() < body_end {
             let need  = body_end - accum.len();
-            let chunk = vec![0u8; need];
-            let (res, chunk) = stream.read(chunk).await;
-            let n = match res {
+            let mut chunk = vec![0u8; need];
+            let n = match stream.read(&mut chunk).await {
                 Ok(0) | Err(_) => return,
                 Ok(n) => n,
             };
@@ -169,12 +158,7 @@ async fn handle_conn(mut stream: UnixStream, state: Arc<AppState>) {
         let resp: &'static [u8] = dispatch(&accum, body_start, body_end, &state);
 
         // ── Write response ────────────────────────────────────────────────
-        // `write_all` takes ownership of the Vec; we allocate one per response.
-        // Cost: one small alloc per request (128-110 bytes), acceptable.
-        let resp_vec = resp.to_vec();
-        let (res, _) = stream.write_all(resp_vec).await;
-
-        if res.is_err() || is_close {
+        if stream.write_all(resp).await.is_err() || is_close {
             return;
         }
     }
@@ -182,10 +166,6 @@ async fn handle_conn(mut stream: UnixStream, state: Arc<AppState>) {
 
 // ── HTTP parsing ──────────────────────────────────────────────────────────────
 
-/// Parses the HTTP request head from `buf`.
-///
-/// Returns `(header_end_byte, content_length, connection_close)` if a complete
-/// header block is found, or `None` if more data is needed.
 fn parse_head(buf: &[u8]) -> Option<(usize, usize, bool)> {
     let mut headers = [httparse::EMPTY_HEADER; 24];
     let mut req = httparse::Request::new(&mut headers);
@@ -210,15 +190,7 @@ fn parse_head(buf: &[u8]) -> Option<(usize, usize, bool)> {
 
 // ── Request dispatcher ────────────────────────────────────────────────────────
 
-fn dispatch(
-    buf: &[u8],
-    body_start: usize,
-    body_end: usize,
-    state: &AppState,
-) -> &'static [u8] {
-    // Fast path: distinguish GET /ready from POST /fraud-score by inspecting
-    // the first bytes of the request line. Both paths are always used with the
-    // exact spellings nginx generates.
+fn dispatch(buf: &[u8], body_start: usize, body_end: usize, state: &AppState) -> &'static [u8] {
     if buf.starts_with(b"GET /ready") {
         return if READY.load(Ordering::Acquire) { HTTP_READY_OK } else { HTTP_READY_503 };
     }
@@ -230,10 +202,6 @@ fn dispatch(
     HTTP_404
 }
 
-/// Parses the JSON body, runs fraud scoring, returns the pre-built HTTP response.
-///
-/// On any parse or arithmetic error, returns `HTTP_FRAUD[0]` (approved=true,
-/// score=0.0). FP=1pt is always better than Err=5pt in the scoring formula.
 fn score_body(body: &[u8], state: &AppState) -> &'static [u8] {
     let payload: models::TransactionPayload = match serde_json::from_slice(body) {
         Ok(p) => p,
@@ -256,12 +224,9 @@ fn score_body(body: &[u8], state: &AppState) -> &'static [u8] {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-/// Runs synthetic queries before accepting traffic to warm CPU caches.
 fn warmup_index(index: &IvfIndex, count: usize) {
     let mut state = 0x12345678u32;
     for _ in 0..count {

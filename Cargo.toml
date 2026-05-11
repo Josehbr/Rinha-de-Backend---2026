@@ -12,8 +12,8 @@ name = "build-index"
 path = "src/bin/build_index.rs"
 
 [dependencies]
-# HTTP runtime — thread-per-core io_uring (falls back to legacy/epoll)
-monoio = { version = "0.2.4", features = ["iouring", "legacy", "macros"] }
+# HTTP runtime — single-threaded tokio, suporte nativo a UDS
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
 
 # Lightweight HTTP/1.1 request parser (zero-copy, zero alloc)
 httparse = "1.10.1"

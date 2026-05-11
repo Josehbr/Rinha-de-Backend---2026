@@ -1,0 +1,24 @@
+services:
+  # Overlay para simular Haswell: CPU drasticamente reduzida.
+  # Local Ryzen 7 5700X é ~5× mais rápido que Haswell, então cortamos por 5
+  # para tentar reproduzir o gargalo do ambiente da Rinha.
+  nginx:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.04"
+          memory: "20MB"
+
+  api1:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.08"
+          memory: "160MB"
+
+  api2:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.08"
+          memory: "160MB"

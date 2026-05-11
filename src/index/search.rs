@@ -355,7 +355,7 @@ pub fn update_top5_blocks(
 mod tests {
     use super::*;
     use crate::index::kmeans::kmeans;
-    use crate::index::quantize::{quantize_i16, quantize_query};
+    use crate::index::quantize::quantize_query;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
