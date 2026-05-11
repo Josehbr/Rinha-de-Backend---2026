@@ -24,3 +24,10 @@ test/test-bypass.js
 # OS
 .DS_Store
 Thumbs.db
+
+# Especificação interna (não vai para o repo público)
+CLAUDE.md
+.claude/
+
+# Plans privados (Claude Code)
+.claude/plans/
