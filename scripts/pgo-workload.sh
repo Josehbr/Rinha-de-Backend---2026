@@ -3,11 +3,11 @@
 # the LLVM profile representative branch + path coverage of the hot loops.
 #
 # Runs inside the PGO build stage. The fraud-api binary must already be
-# running on localhost:9998 (UDS not needed for profile-gen).
+# listening on the Unix Domain Socket at $UDS.
 
 set -e
 
-URL="${URL:-http://localhost:9998/fraud-score}"
+UDS="${UDS:-/tmp/pgo-api.sock}"
 REPS="${REPS:-200}"
 PAYLOADS="/app/resources/example-payloads.json"
 
@@ -16,23 +16,24 @@ if [ ! -f "$PAYLOADS" ]; then
     exit 1
 fi
 
-# Number of payloads
 N=$(python3 -c "import json;print(len(json.load(open('$PAYLOADS'))))")
-echo "[pgo-workload] $N payloads × $REPS reps = $((N * REPS)) requests"
+echo "[pgo-workload] $N payloads × $REPS reps = $((N * REPS)) requests via UDS=$UDS"
 
+# Generate one JSON payload per line, then pipe to curl via the UDS socket.
 i=0
 while [ "$i" -lt "$REPS" ]; do
     python3 -c "
-import json, urllib.request, sys
-data=json.load(open('$PAYLOADS'))
+import json, sys
+data = json.load(open('$PAYLOADS'))
 for p in data:
-    body = json.dumps(p.get('request', p)).encode()
-    req = urllib.request.Request('$URL', body, headers={'Content-Type':'application/json'})
-    try:
-        urllib.request.urlopen(req, timeout=2).read()
-    except Exception as e:
-        print('err:', e, file=sys.stderr)
-"
+    # Support both {request: {...}} and flat payload formats
+    body = p.get('request', p)
+    sys.stdout.write(json.dumps(body) + '\n')
+" | while IFS= read -r body; do
+        curl -sf --unix-socket "$UDS" http://localhost/fraud-score \
+            -H 'Content-Type: application/json' \
+            -d "$body" > /dev/null || true
+    done
     i=$((i + 1))
 done
 

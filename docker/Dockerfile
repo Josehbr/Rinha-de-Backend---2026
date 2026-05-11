@@ -57,16 +57,18 @@ RUN chmod +x /usr/local/bin/pgo-workload.sh
 ENV PGO_DIR=/tmp/pgo-data
 ENV INDEX_PATH=/app/index.bin
 ENV MCC_RISK_PATH=/app/resources/mcc_risk.json
-ENV PORT=9998
+# monoio binds to UDS; no TCP port needed for profiling.
+ENV BIND_UDS=/tmp/pgo-api.sock
+ENV UDS=/tmp/pgo-api.sock
 # LLVM_PROFILE_FILE força flush do profile no exit (suporta padrões %m, %p)
 ENV LLVM_PROFILE_FILE=/tmp/pgo-data/profraw-%m_%p.profraw
 
-# Sobe servidor, espera ready, roda workload, derruba, merge profile
+# Sobe servidor, espera UDS aparecer, roda workload, derruba, merge profile
 RUN mkdir -p $PGO_DIR /pgo && \
     fraud-api & \
     SERVER_PID=$! && \
-    sleep 3 && \
-    curl -sf http://localhost:9998/ready && \
+    until [ -S /tmp/pgo-api.sock ]; do sleep 0.1; done && \
+    curl -sf --unix-socket /tmp/pgo-api.sock http://localhost/ready && \
     /usr/local/bin/pgo-workload.sh && \
     kill -TERM $SERVER_PID && \
     wait $SERVER_PID 2>/dev/null || true && \
