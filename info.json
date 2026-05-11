@@ -1,0 +1,10 @@
+{
+    "participants": ["José Hernane"],
+    "social": [
+        "https://github.com/Josehbr",
+        "https://www.linkedin.com/in/jos%C3%A9-hernane-16706b1b6/"
+    ],
+    "source-code-repo": "https://github.com/Josehbr/Rinha-de-Backend---2026",
+    "stack": ["rust", "actix-web", "nginx", "ivf-knn", "avx2-simd"],
+    "open_to_work": false
+}

@@ -18,19 +18,16 @@ services:
           memory: "20MB"
 
   api1:
-    image: fraud-api:latest
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
+    image: josehbr/fraud-api:v1
     restart: on-failure
     volumes:
       - sockets:/sockets
     environment:
       - RUST_LOG=warn
       - BIND_UDS=/sockets/api1.sock
-      - NPROBE=${NPROBE:-24}
-      - FULL_NPROBE=${FULL_NPROBE:-72}
-      - WORKERS=${WORKERS:-1}
+      - NPROBE=24
+      - FULL_NPROBE=72
+      - WORKERS=1
     healthcheck:
       test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api1.sock"]
       interval: 5s
@@ -44,16 +41,16 @@ services:
           memory: "160MB"
 
   api2:
-    image: fraud-api:latest
+    image: josehbr/fraud-api:v1
     restart: on-failure
     volumes:
       - sockets:/sockets
     environment:
       - RUST_LOG=warn
       - BIND_UDS=/sockets/api2.sock
-      - NPROBE=${NPROBE:-24}
-      - FULL_NPROBE=${FULL_NPROBE:-72}
-      - WORKERS=${WORKERS:-1}
+      - NPROBE=24
+      - FULL_NPROBE=72
+      - WORKERS=1
     healthcheck:
       test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api2.sock"]
       interval: 5s
@@ -73,4 +70,4 @@ volumes:
       type: tmpfs
       device: tmpfs
 
-# Totais: 1.0 CPU, 350 MB — dentro do limite da Rinha
+# Totais: 1.0 CPU, 340 MB — dentro do limite da Rinha (1.0 CPU, 350 MB)
