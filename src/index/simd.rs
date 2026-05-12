@@ -65,13 +65,29 @@ unsafe fn scan_block_avx2(
             }};
         }
 
-        // First 8 dims: rotate through 4 accumulators (dims 0-3 then 4-7).
-        acc_dim!(acc0, 0); acc_dim!(acc1, 1); acc_dim!(acc2, 2); acc_dim!(acc3, 3);
-        acc_dim!(acc0, 4); acc_dim!(acc1, 5); acc_dim!(acc2, 6); acc_dim!(acc3, 7);
+        // First 4 dims: rotate through 4 accumulators (one dim each, breaks FMA chain).
+        acc_dim!(acc0, 0);
+        acc_dim!(acc1, 1);
+        acc_dim!(acc2, 2);
+        acc_dim!(acc3, 3);
 
-        // Early exit on partial sum of all 4 accumulators.
-        let partial = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        // Early exit @4 dims: check if ALL 8 slots already exceed threshold.
+        // 4 dimensions is enough to distinguish far blocks when Top5 threshold
+        // is tight (late clusters in the probe sequence).
+        let partial4 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
         let thresh_v = _mm256_set1_ps(threshold);
+        if _mm256_movemask_ps(_mm256_cmp_ps(partial4, thresh_v, _CMP_GT_OS)) == 0xFF {
+            return [f32::MAX; BLOCK_SIZE];
+        }
+
+        // Dims 4-7: rotate through 4 accumulators.
+        acc_dim!(acc0, 4);
+        acc_dim!(acc1, 5);
+        acc_dim!(acc2, 6);
+        acc_dim!(acc3, 7);
+
+        // Early exit @8 dims on partial sum of all 4 accumulators.
+        let partial = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
         if _mm256_movemask_ps(_mm256_cmp_ps(partial, thresh_v, _CMP_GT_OS)) == 0xFF {
             return [f32::MAX; BLOCK_SIZE];
         }

@@ -20,10 +20,11 @@ use index::quantize::quantize_i16;
 
 const INPUT_PATH: &str = "resources/references.json.gz";
 const OUTPUT_PATH: &str = "index.bin";
-/// NLIST=16384: clusters ainda menores (183 vec/cluster ~5.1 KB cada).
-/// NPROBE=24 × 5.1 KB = 123 KB → cabe FOLGADO em L2 (256 KB).
-/// Trade-off: centroids = 16384 × 14 × 4 = 918 KB (estoura L2, vai pra L3).
-const NLIST: usize = 16384;
+/// NLIST=8192: sweet spot para Haswell L2=256KB.
+/// NPROBE=24 × 46 blocks × 224B = 242 KB working set → cabe em L2.
+/// Centroids f32 = 8192 × 56B = 448 KB (L3). Centroids i16 (future) = 224 KB (L2).
+/// v5 com NLIST=16384 regrediu p99 de 3.42→4.10ms (centroids 896KB em L3).
+const NLIST: usize = 8192;
 const NPROBE: u32 = 24;
 const NITER: usize = 30;
 const LOG_EVERY: usize = 500_000;

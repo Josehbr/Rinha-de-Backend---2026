@@ -331,6 +331,16 @@ pub fn update_top5_blocks(
     let mut threshold = top5.worst();
 
     for (b_idx, block) in blocks.iter().enumerate() {
+        // Prefetch 2 blocks ahead: 2 × 224B = 448B = 14 cache lines.
+        // Hides L3/DRAM latency on Haswell when working set spills L2.
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            if let Some(next) = blocks.get(b_idx + 2) {
+                unsafe { _mm_prefetch((next as *const VectorBlock).cast::<i8>(), _MM_HINT_T0); }
+            }
+        }
+
         let dists = scan_block(query_i16, block, threshold);
 
         for slot in 0..BLOCK_SIZE {

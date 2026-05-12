@@ -51,6 +51,7 @@ RUN rustup component add llvm-tools-preview
 COPY --from=pgo-instrumented /usr/local/bin/fraud-api-pgo-gen /usr/local/bin/fraud-api
 COPY --from=index-builder /app/index.bin ./index.bin
 COPY resources/ ./resources/
+COPY test/test-data.json /app/test/
 COPY scripts/pgo-workload.sh /usr/local/bin/pgo-workload.sh
 RUN chmod +x /usr/local/bin/pgo-workload.sh
 

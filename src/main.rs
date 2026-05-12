@@ -118,18 +118,20 @@ async fn server_loop(state: Arc<AppState>) {
 
 async fn handle_conn(mut stream: UnixStream, state: Arc<AppState>) {
     let mut accum: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk_buf = [0u8; 4096]; // stack buffer — evita malloc por chunk
 
     loop {
         accum.clear();
 
         // ── Accumulate complete request ────────────────────────────────────
         let (header_end, content_length, is_close) = loop {
-            let mut chunk = vec![0u8; 4096usize.saturating_sub(accum.len()).max(512)];
-            let n = match stream.read(&mut chunk).await {
+            let cap = 4096usize.saturating_sub(accum.len()).max(512);
+            let read_buf = &mut chunk_buf[..cap];
+            let n = match stream.read(read_buf).await {
                 Ok(0) | Err(_) => return,
                 Ok(n) => n,
             };
-            accum.extend_from_slice(&chunk[..n]);
+            accum.extend_from_slice(&chunk_buf[..n]);
 
             match parse_head(&accum) {
                 Some(x) => break x,
@@ -139,19 +141,17 @@ async fn handle_conn(mut stream: UnixStream, state: Arc<AppState>) {
         };
 
         // ── Read remaining body bytes ──────────────────────────────────────
-        // httparse Status::Complete(n) already includes the \r\n\r\n separator,
-        // so body starts at header_end (not header_end + 4).
         let body_start = header_end;
         let body_end   = body_start + content_length;
 
         while accum.len() < body_end {
             let need  = body_end - accum.len();
-            let mut chunk = vec![0u8; need];
-            let n = match stream.read(&mut chunk).await {
+            let read_buf = &mut chunk_buf[..need.min(4096)];
+            let n = match stream.read(read_buf).await {
                 Ok(0) | Err(_) => return,
                 Ok(n) => n,
             };
-            accum.extend_from_slice(&chunk[..n]);
+            accum.extend_from_slice(&chunk_buf[..n]);
         }
 
         // ── Dispatch ──────────────────────────────────────────────────────

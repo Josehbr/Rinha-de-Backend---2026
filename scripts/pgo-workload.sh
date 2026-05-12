@@ -13,13 +13,20 @@ set -e
 UDS="${UDS:-/tmp/pgo-api.sock}"
 REPS="${REPS:-200}"
 PAYLOADS="/app/resources/example-payloads.json"
+TEST_DATA="/app/test/test-data.json"
+
+# Prefer test-data.json (54K entries) for better PGO coverage than example-payloads (32)
+if [ -f "$TEST_DATA" ]; then
+    PAYLOADS="$TEST_DATA"
+    IS_TEST_DATA=1
+fi
 
 if [ ! -f "$PAYLOADS" ]; then
     echo "[pgo-workload] missing $PAYLOADS"
     exit 1
 fi
 
-N=$(python3 -c "import json;print(len(json.load(open('$PAYLOADS'))))")
+N=$(python3 -c "import json; d=json.load(open('$PAYLOADS')); entries=d.get('entries', d); print(len(entries))")
 echo "[pgo-workload] $N payloads × $REPS reps = $((N * REPS)) requests via UDS=$UDS"
 
 python3 - "$PAYLOADS" "$UDS" "$REPS" << 'PYEOF'
@@ -27,7 +34,8 @@ import json, socket, sys, time
 
 payloads_path, uds_path, reps = sys.argv[1], sys.argv[2], int(sys.argv[3])
 data = json.load(open(payloads_path))
-payloads = [json.dumps(p.get('request', p)).encode() for p in data]
+entries = data.get('entries', data)  # test-data.json has 'entries' wrapper
+payloads = [json.dumps(e.get('request', e)).encode() for e in entries]
 
 def send_request(sock, body):
     req = (
