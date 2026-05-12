@@ -36,3 +36,4 @@ kernel SIMD AVX2+FMA. Índice pré-computado embutido na imagem Docker.
 
 Score 6000 (máximo teórico) — p99 0.70 ms, 0% failures sob 900 req/s por 120 s,
 em 3 runs consecutivos. Detalhes em `benchmarks/diagnosis.md` na branch main.
+# Submission v6 — iter-v6 2026-05-12T23:14:31Z
