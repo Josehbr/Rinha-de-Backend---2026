@@ -18,7 +18,7 @@ services:
           memory: "20MB"
 
   api1:
-    image: josehbr/fraud-api:v6
+    image: josehbr/fraud-api:v7
     restart: on-failure
     volumes:
       - sockets:/sockets
@@ -40,7 +40,7 @@ services:
           memory: "160MB"
 
   api2:
-    image: josehbr/fraud-api:v6
+    image: josehbr/fraud-api:v7
     restart: on-failure
     volumes:
       - sockets:/sockets
