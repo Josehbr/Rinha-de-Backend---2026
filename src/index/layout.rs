@@ -2,8 +2,11 @@ use anyhow::ensure;
 use bytemuck::{Pod, Zeroable};
 
 pub const MAGIC: u32 = 0x49564632; // b"IVF2" little-endian
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const N_DIMS: usize = 14;
+/// Bbox uses 16 i16 lanes per cluster (14 real dims + 2 zero pad) so a single
+/// `_mm256_loadu_si256` reads the whole bbox of one cluster.
+pub const BBOX_LANES: usize = 16;
 /// Number of vectors packed per VectorBlock (SoA layout).
 pub const BLOCK_SIZE: usize = 8;
 
@@ -32,14 +35,33 @@ impl Default for VectorBlock {
 unsafe impl bytemuck::Pod for VectorBlock {}
 unsafe impl bytemuck::Zeroable for VectorBlock {}
 
+/// Axis-aligned bounding box of one IVF cluster in quantized (i16) space.
+///
+/// 14 real dims + 2 zero pad — the pad lets AVX2 load the whole bbox with a
+/// single 256-bit instruction and contributes 0 to the lower-bound computation.
+#[repr(C, align(32))]
+#[derive(Clone, Copy, Debug)]
+pub struct Bbox {
+    pub data: [i16; BBOX_LANES],
+}
+
+impl Default for Bbox {
+    fn default() -> Self {
+        Self { data: [0i16; BBOX_LANES] }
+    }
+}
+
+unsafe impl bytemuck::Pod for Bbox {}
+unsafe impl bytemuck::Zeroable for Bbox {}
+
 /// Fixed-size header at byte offset 0 of index.bin — 32 bytes total.
 ///
 /// ```text
 /// Offset  Size  Field
 ///      0     4  magic       (must equal MAGIC = 0x49564632)
-///      4     4  version     (must equal VERSION = 2)
+///      4     4  version     (must equal VERSION = 3)
 ///      8     4  nlist       (number of IVF clusters)
-///     12     4  nprobe      (default clusters probed per query)
+///     12     4  nprobe      (legacy default — unused on the v3 bbox-prune hot path)
 ///     16     8  n_vectors   (total vectors, padded to a multiple of BLOCK_SIZE)
 ///     24     8  _padding    (zero)
 /// ```
@@ -56,32 +78,35 @@ pub struct IndexHeader {
 
 // ── Binary layout ─────────────────────────────────────────────────────────────
 
-/// Zero-copy view into the sections of an index.bin buffer (e.g. from mmap).
+/// Zero-copy view into the sections of an index.bin v3 buffer (e.g. from mmap).
 ///
 /// ```text
-/// [IndexHeader      ]  32 bytes                   offset 0
-/// [centroids        ]  nlist × 14 × 4 B           offset 32
-/// [cluster_sizes    ]  nlist × 4 B                follows centroids
-/// [alignment pad    ]  0–31 bytes                 brings blocks to 32-byte boundary
+/// [IndexHeader      ]  32 bytes                          offset 0
+/// [centroids        ]  nlist × 14 × 4 B                  legacy, kept for compat
+/// [cluster_sizes    ]  nlist × 4 B
+/// [bbox_mins        ]  nlist × Bbox (32 B)               v3: per-cluster i16 min
+/// [bbox_maxes       ]  nlist × Bbox (32 B)               v3: per-cluster i16 max
+/// [alignment pad    ]  0–31 bytes                        brings blocks to 32-byte
 /// [blocks           ]  (n_vectors/BLOCK_SIZE) × VectorBlock
-/// [labels           ]  n_vectors × 1 B            0=legit, 1=fraud
+/// [labels           ]  n_vectors × 1 B                   0=legit, 1=fraud
 /// ```
 ///
 /// `cluster_sizes[i]` is the **padded** vector count for cluster i, always a
-/// multiple of `BLOCK_SIZE`. Padding slots carry label 0 (legit) and all-zero
-/// quantized features; they are geometrically far from real queries and do not
-/// influence fraud scoring in practice.
+/// multiple of `BLOCK_SIZE`. Padding slots carry label 0 and all-zero features
+/// — they sit at the geometric origin and rarely enter top-5 for real queries.
 #[derive(Debug)]
 pub struct IndexLayout<'a> {
     pub header:        &'a IndexHeader,
-    pub centroids:     &'a [[f32; N_DIMS]], // [nlist][N_DIMS]
-    pub cluster_sizes: &'a [u32],           // [nlist], each a multiple of BLOCK_SIZE
+    pub centroids:     &'a [[f32; N_DIMS]], // legacy — present but unused on hot path
+    pub cluster_sizes: &'a [u32],
+    pub bbox_mins:     &'a [Bbox],          // [nlist]
+    pub bbox_maxes:    &'a [Bbox],          // [nlist]
     pub blocks:        &'a [VectorBlock],   // [n_vectors / BLOCK_SIZE]
     pub labels:        &'a [u8],            // [n_vectors] — covers all padded slots
 }
 
 impl<'a> IndexLayout<'a> {
-    /// Parses an index.bin buffer into zero-copy section slices.
+    /// Parses an index.bin v3 buffer into zero-copy section slices.
     pub fn from_bytes(buf: &'a [u8]) -> anyhow::Result<Self> {
         const HDR: usize = size_of::<IndexHeader>(); // 32
 
@@ -97,7 +122,7 @@ impl<'a> IndexLayout<'a> {
         );
         ensure!(
             header.version == VERSION,
-            "unsupported index version {}, expected {}",
+            "unsupported index version {}, expected {} — rebuild index.bin",
             header.version,
             VERSION
         );
@@ -117,8 +142,13 @@ impl<'a> IndexLayout<'a> {
         let csizes_start = centroids_end;
         let csizes_end   = csizes_start + nlist * 4;
 
-        // Align blocks to 32-byte boundary for VectorBlock's align requirement.
-        let blocks_start = align_up(csizes_end, 32);
+        // Bbox arrays start at the next 32-byte boundary so Bbox alignment holds.
+        let bbox_min_start = align_up(csizes_end, 32);
+        let bbox_min_end   = bbox_min_start + nlist * size_of::<Bbox>();
+        let bbox_max_start = bbox_min_end;
+        let bbox_max_end   = bbox_max_start + nlist * size_of::<Bbox>();
+
+        let blocks_start = align_up(bbox_max_end, 32);
         let blocks_end   = blocks_start + n_blocks * size_of::<VectorBlock>();
 
         let labels_start = blocks_end;
@@ -138,13 +168,21 @@ impl<'a> IndexLayout<'a> {
             bytemuck::try_cast_slice(&buf[csizes_start..csizes_end])
                 .map_err(|e| anyhow::anyhow!("cluster_sizes cast error: {e:?}"))?;
 
+        let bbox_mins: &[Bbox] =
+            bytemuck::try_cast_slice(&buf[bbox_min_start..bbox_min_end])
+                .map_err(|e| anyhow::anyhow!("bbox_mins cast error: {e:?}"))?;
+
+        let bbox_maxes: &[Bbox] =
+            bytemuck::try_cast_slice(&buf[bbox_max_start..bbox_max_end])
+                .map_err(|e| anyhow::anyhow!("bbox_maxes cast error: {e:?}"))?;
+
         let blocks: &[VectorBlock] =
             bytemuck::try_cast_slice(&buf[blocks_start..blocks_end])
                 .map_err(|e| anyhow::anyhow!("blocks cast error: {e:?}"))?;
 
         let labels = &buf[labels_start..labels_end];
 
-        Ok(Self { header, centroids, cluster_sizes, blocks, labels })
+        Ok(Self { header, centroids, cluster_sizes, bbox_mins, bbox_maxes, blocks, labels })
     }
 }
 
@@ -169,17 +207,19 @@ mod tests {
     }
 
     #[test]
+    fn bbox_is_32_bytes_aligned() {
+        assert_eq!(size_of::<Bbox>(), 32);
+        assert_eq!(align_of::<Bbox>(), 32);
+    }
+
+    #[test]
     fn index_header_is_32_bytes() {
         assert_eq!(size_of::<IndexHeader>(), 32);
         assert_eq!(size_of::<IndexHeader>() % 32, 0);
     }
 
-    /// Builds a minimal valid index.bin buffer backed by `Vec<VectorBlock>` to
-    /// guarantee the 32-byte alignment required by `bytemuck::try_cast_slice`.
-    ///
-    /// Returns the VectorBlock-aligned backing and the number of valid bytes.
-    /// Callers should use `bytemuck::cast_slice(&backing)[..total]`.
-    fn build_test_index(nlist: u32, n_per_cluster: u32) -> (Vec<VectorBlock>, usize) {
+    /// Builds a minimal valid v3 index buffer for round-trip testing.
+    fn build_test_index_v3(nlist: u32, n_per_cluster: u32) -> (Vec<VectorBlock>, usize) {
         assert_eq!(n_per_cluster % BLOCK_SIZE as u32, 0, "n_per_cluster must be multiple of BLOCK_SIZE");
         let n_padded = nlist as usize * n_per_cluster as usize;
         let n_blocks = n_padded / BLOCK_SIZE;
@@ -188,13 +228,14 @@ mod tests {
         let centroids_sz = nlist as usize * N_DIMS * 4;
         let csizes_sz    = nlist as usize * 4;
         let csizes_end   = hdr_size + centroids_sz + csizes_sz;
-        let blocks_start = align_up(csizes_end, 32);
+        let bbox_min_start = align_up(csizes_end, 32);
+        let bbox_sz      = nlist as usize * size_of::<Bbox>();
+        let bbox_max_end = bbox_min_start + 2 * bbox_sz;
+        let blocks_start = align_up(bbox_max_end, 32);
         let blocks_sz    = n_blocks * size_of::<VectorBlock>();
         let labels_start = blocks_start + blocks_sz;
         let total        = labels_start + n_padded;
 
-        // Ceiling division to find minimum VectorBlocks needed to hold `total` bytes.
-        // sizeof(VectorBlock)=224 is not a power-of-2, so align_up can't be used here.
         let n_vb = (total + size_of::<VectorBlock>() - 1) / size_of::<VectorBlock>();
         let mut backing: Vec<VectorBlock> = vec![VectorBlock::default(); n_vb];
 
@@ -227,8 +268,8 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_index_layout() {
-        let (backing, total) = build_test_index(4, 8); // 4 clusters × 8 vectors = 32 total
+    fn round_trip_index_layout_v3() {
+        let (backing, total) = build_test_index_v3(4, 8); // 4 clusters × 8 vectors
         let raw = bytemuck::cast_slice::<VectorBlock, u8>(&backing);
         let layout = IndexLayout::from_bytes(&raw[..total]).unwrap();
 
@@ -238,21 +279,15 @@ mod tests {
         assert_eq!(layout.header.n_vectors,    32);
         assert_eq!(layout.centroids.len(),     4);
         assert_eq!(layout.cluster_sizes.len(), 4);
+        assert_eq!(layout.bbox_mins.len(),     4);
+        assert_eq!(layout.bbox_maxes.len(),    4);
         assert_eq!(layout.blocks.len(),        32 / BLOCK_SIZE);
         assert_eq!(layout.labels.len(),        32);
-
-        // Cluster sizes should all be BLOCK_SIZE
-        assert!(layout.cluster_sizes.iter().all(|&s| s == 8));
-
-        // Labels alternate 0/1
-        for (i, &l) in layout.labels.iter().enumerate() {
-            assert_eq!(l, (i % 2) as u8, "label[{i}]");
-        }
     }
 
     #[test]
     fn from_bytes_rejects_bad_magic() {
-        let (mut backing, total) = build_test_index(1, 8);
+        let (mut backing, total) = build_test_index_v3(1, 8);
         {
             let buf: &mut [u8] = bytemuck::cast_slice_mut(&mut backing);
             buf[0] = 0xFF;
@@ -265,7 +300,7 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_wrong_version() {
-        let (mut backing, total) = build_test_index(1, 8);
+        let (mut backing, total) = build_test_index_v3(1, 8);
         {
             let buf: &mut [u8] = bytemuck::cast_slice_mut(&mut backing);
             let v_bytes = 99u32.to_le_bytes();

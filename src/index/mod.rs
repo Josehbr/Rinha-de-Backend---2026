@@ -14,9 +14,14 @@ use memmap2::{Mmap, MmapOptions};
 use crate::index::layout::{BLOCK_SIZE, IndexLayout, N_DIMS};
 use crate::index::quantize::quantize_query;
 use crate::index::search::{
-    DistF32, Top5, find_nearest_clusters, find_nearest_clusters_inplace, update_top_k_blocks,
-    update_top5_blocks,
+    DistF32, Top5, bbox_lower_bound, query_to_bbox_lanes, update_top5_blocks,
+    update_top_k_blocks,
 };
+
+/// Upper bound on `nlist` accepted by the bbox-prune path. Used to size a
+/// stack-allocated sort buffer to avoid per-request allocations.
+/// Current production builds use nlist=4096; this leaves room for experiments.
+const MAX_NLIST: usize = 16_384;
 
 /// Encapsulates the mmap'd IVF index and provides a safe, thread-safe search API.
 pub struct IvfIndex {
@@ -27,12 +32,7 @@ pub struct IvfIndex {
     layout: IndexLayout<'static>,
     /// Starting BLOCK index for each cluster (cumulative sum of padded_sizes / BLOCK_SIZE).
     cluster_block_offsets: Vec<usize>,
-    nprobe: usize,
-    /// Clusters probed when fraud_count ∈ {2,3} (ambiguous zone). Default = nprobe * 3.
-    full_nprobe: usize,
 }
-
-const MAX_NPROBE: usize = 64;
 
 impl IvfIndex {
     /// Loads and parses `index.bin` from disk into a zero-copy mmap view.
@@ -58,8 +58,13 @@ impl IvfIndex {
         let parsed_layout = IndexLayout::from_bytes(&mmap)
             .with_context(|| format!("falha ao parsear layout de {}", path.display()))?;
 
-        let nprobe = parsed_layout.header.nprobe as usize;
-        let full_nprobe = nprobe * 3;
+        anyhow::ensure!(
+            parsed_layout.bbox_mins.len() <= MAX_NLIST,
+            "nlist {} exceeds MAX_NLIST {}",
+            parsed_layout.bbox_mins.len(),
+            MAX_NLIST,
+        );
+
         let cluster_block_offsets = build_cluster_block_offsets(parsed_layout.cluster_sizes);
 
         // SAFETY: `parsed_layout` borrows from `mmap`. We move both into `Self`, and
@@ -72,15 +77,13 @@ impl IvfIndex {
             _mmap: mmap,
             layout,
             cluster_block_offsets,
-            nprobe,
-            full_nprobe,
         })
     }
 
     /// Returns the global top-k `(distance, label)` across probed IVF clusters.
     ///
-    /// Uses `Top5` internally (always probes for 5 neighbours) and truncates to `k`.
-    /// k > 5 falls back to the BinaryHeap path for correctness.
+    /// k ≤ 5 uses the bbox-prune hot path with `Top5`; larger k falls back to
+    /// a `BinaryHeap` scan over every cluster (correctness-only path for tests).
     pub fn search_knn(&self, query: &[f32; N_DIMS], k: usize) -> Vec<(DistF32, u8)> {
         if k == 0 {
             return Vec::new();
@@ -88,13 +91,13 @@ impl IvfIndex {
 
         if k <= 5 {
             let mut top5 = Top5::new();
-            self.fill_top5(query, self.nprobe, &mut top5);
+            self.fill_top5_bbox_prune(query, &mut top5);
             return top5.iter().take(k).map(|&(d, l)| (DistF32(d), l)).collect();
         }
 
         // Fallback for k > 5 (not used in production, correctness path for tests).
         let mut heap: BinaryHeap<(DistF32, u8)> = BinaryHeap::with_capacity(k + 1);
-        self.fill_top_k_heap(query, k, self.nprobe, &mut heap);
+        self.fill_heap_full_scan(query, k, &mut heap);
         let mut out: Vec<(DistF32, u8)> = heap.into_iter().collect();
         out.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         out
@@ -102,82 +105,65 @@ impl IvfIndex {
 
     /// Computes fraud score as `frauds_in_top5 / 5.0`.
     ///
-    /// Two-stage strategy: fast probe (nprobe clusters) first, then a full probe
-    /// (full_nprobe) when the initial count lands in {1, 2, 3, 4}. Only counts
-    /// 0 and 5 (unanimous) skip the full probe — every other case might be a
-    /// single wrong vote away from flipping the decision (atomos #4 also uses {2..4}).
-    ///
-    /// Uses `Top5` (sorted array) instead of `BinaryHeap` to avoid heap overhead.
+    /// Single-stage: bbox-prune visits clusters in ascending lower-bound order
+    /// and stops as soon as the next cluster's lower bound ≥ the current top-5
+    /// worst distance. There is no "fast vs full nprobe" — pruning is automatic.
+    /// Mirrors RonieNeubauer #2 (p99 0.86ms, lowest on the leaderboard).
     pub fn fraud_score(&self, query: &[f32; N_DIMS]) -> f32 {
         let mut top5 = Top5::new();
-
-        self.fill_top5(query, self.nprobe, &mut top5);
-        let fast_frauds = top5.count_fraud();
-
-        let frauds = if (1..=4).contains(&fast_frauds) {
-            top5.clear();
-            self.fill_top5(query, self.full_nprobe, &mut top5);
-            top5.count_fraud()
-        } else {
-            fast_frauds
-        };
-
-        frauds as f32 / 5.0
+        self.fill_top5_bbox_prune(query, &mut top5);
+        top5.count_fraud() as f32 / 5.0
     }
 
-    /// Returns the current fast nprobe value.
+    /// `nprobe` is preserved as a no-op API for legacy callers; the bbox-prune
+    /// path ignores it. Returns the value stored in the on-disk header.
     pub fn nprobe(&self) -> usize {
-        self.nprobe
+        self.layout.header.nprobe as usize
     }
 
-    pub fn with_nprobes(mut self, fast: usize, full: usize) -> Self {
-        let max_clusters = self.layout.centroids.len();
-        if fast > 0 {
-            self.nprobe = fast.min(max_clusters);
-        }
-        if full > 0 {
-            self.full_nprobe = full.min(max_clusters);
-        }
+    /// Legacy no-op: kept so existing call sites (e.g. main.rs env var wiring)
+    /// continue to compile. Bbox-prune is parameter-free.
+    pub fn with_nprobes(self, _fast: usize, _full: usize) -> Self {
         self
     }
 
-    /// Hot-path: fills `top5` using `update_top5_blocks` (array, no heap).
-    fn fill_top5(&self, query: &[f32; N_DIMS], nprobe: usize, top5: &mut Top5) {
-        if nprobe == 0 {
+    /// Hot-path: visits clusters in ascending bbox lower-bound order and stops
+    /// as soon as the next cluster cannot improve `top5`.
+    fn fill_top5_bbox_prune(&self, query: &[f32; N_DIMS], top5: &mut Top5) {
+        let nlist = self.layout.bbox_mins.len();
+        if nlist == 0 {
             return;
         }
 
         let query_i16 = quantize_query(query);
+        let q_lanes = query_to_bbox_lanes(&query_i16);
 
-        let dispatch = |cluster_id: usize, top5: &mut Top5| {
-            let Some((bs, be)) = self.cluster_block_range(cluster_id) else {
-                return;
-            };
-            if bs >= be {
-                return;
+        // Compute every cluster's bbox lower bound, packed as (lb_bits << 32 | cid)
+        // so a single u64 sort gives us ascending-distance order with no tuple
+        // overhead. f32 bits sort correctly for non-negative finite values.
+        let mut packed = [0u64; MAX_NLIST];
+        for ci in 0..nlist {
+            let lb = bbox_lower_bound(&q_lanes, &self.layout.bbox_mins[ci], &self.layout.bbox_maxes[ci]);
+            packed[ci] = ((lb.to_bits() as u64) << 32) | (ci as u64);
+        }
+        packed[..nlist].sort_unstable();
+
+        // Walk in order, prune the rest as soon as lb ≥ current worst.
+        for &entry in &packed[..nlist] {
+            let lb_bits = (entry >> 32) as u32;
+            let lb = f32::from_bits(lb_bits);
+
+            if lb >= top5.worst() {
+                break;
             }
+
+            let cluster_id = (entry & 0xFFFF_FFFF) as usize;
+            let Some((bs, be)) = self.cluster_block_range(cluster_id) else { continue };
+            if bs >= be { continue; }
+
             let blocks = &self.layout.blocks[bs..be];
             let labels = &self.layout.labels[bs * BLOCK_SIZE..be * BLOCK_SIZE];
             update_top5_blocks(&query_i16, blocks, labels, top5);
-        };
-
-        if nprobe <= MAX_NPROBE {
-            let mut cluster_ids = [0usize; MAX_NPROBE];
-            let mut cluster_dists = [0.0f32; MAX_NPROBE];
-            let used = find_nearest_clusters_inplace(
-                query,
-                self.layout.centroids,
-                nprobe,
-                &mut cluster_ids,
-                &mut cluster_dists,
-            );
-            for &cid in &cluster_ids[..used] {
-                dispatch(cid, top5);
-            }
-        } else {
-            for cid in find_nearest_clusters(query, self.layout.centroids, nprobe) {
-                dispatch(cid, top5);
-            }
         }
     }
 
@@ -190,48 +176,22 @@ impl IvfIndex {
         Some((start, end))
     }
 
-    fn fill_top_k_heap(
+    /// Test-only correctness path: scans every cluster's blocks against the heap.
+    /// Used by `search_knn(k > 5)`; not exercised on the production hot path.
+    fn fill_heap_full_scan(
         &self,
         query: &[f32; N_DIMS],
         k: usize,
-        nprobe: usize,
         heap: &mut BinaryHeap<(DistF32, u8)>,
     ) {
-        if k == 0 {
-            return;
-        }
-
         let query_i16 = quantize_query(query);
-
-        let dispatch = |cluster_id: usize, heap: &mut BinaryHeap<(DistF32, u8)>| {
-            let Some((bs, be)) = self.cluster_block_range(cluster_id) else {
-                return;
-            };
-            if bs >= be {
-                return;
-            }
+        let nlist = self.layout.cluster_sizes.len();
+        for cluster_id in 0..nlist {
+            let Some((bs, be)) = self.cluster_block_range(cluster_id) else { continue };
+            if bs >= be { continue; }
             let blocks = &self.layout.blocks[bs..be];
             let labels = &self.layout.labels[bs * BLOCK_SIZE..be * BLOCK_SIZE];
             update_top_k_blocks(&query_i16, blocks, labels, k, heap);
-        };
-
-        if nprobe <= MAX_NPROBE {
-            let mut cluster_ids = [0usize; MAX_NPROBE];
-            let mut cluster_dists = [0.0f32; MAX_NPROBE];
-            let used = find_nearest_clusters_inplace(
-                query,
-                self.layout.centroids,
-                nprobe,
-                &mut cluster_ids,
-                &mut cluster_dists,
-            );
-            for &cid in &cluster_ids[..used] {
-                dispatch(cid, heap);
-            }
-        } else {
-            for cid in find_nearest_clusters(query, self.layout.centroids, nprobe) {
-                dispatch(cid, heap);
-            }
         }
     }
 }
@@ -263,7 +223,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::index::layout::{IndexHeader, MAGIC, VERSION, VectorBlock};
+    use crate::index::layout::{Bbox, IndexHeader, MAGIC, VERSION, VectorBlock, align_up};
     use bytemuck::bytes_of;
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -281,28 +241,29 @@ mod tests {
         std::env::temp_dir().join(format!("{name}-{nanos}.bin"))
     }
 
-    /// Builds a minimal valid index.bin in the new VERSION=2 format.
-    ///
-    /// 1 cluster, n_per_cluster vectors (padded to multiple of BLOCK_SIZE),
-    /// with labels alternating legit/fraud.
+    /// Builds a minimal valid v3 index.bin file with one cluster of `n_per_cluster`
+    /// vectors (padded to a multiple of `BLOCK_SIZE`), labels alternating
+    /// legit/fraud, and a tight bbox covering the real vectors.
     fn build_tiny_index_file(path: &Path, n_per_cluster: usize) {
         use crate::index::quantize::quantize_i16;
 
-        let n_padded = crate::index::layout::align_up(n_per_cluster, BLOCK_SIZE);
+        let n_padded = align_up(n_per_cluster, BLOCK_SIZE);
         let nlist: u32 = 1;
         let n_blocks = n_padded / BLOCK_SIZE;
 
-        let hdr_size     = std::mem::size_of::<IndexHeader>(); // 32
-        let centroids_sz = nlist as usize * N_DIMS * 4;
-        let csizes_sz    = nlist as usize * 4;
-        let csizes_end   = hdr_size + centroids_sz + csizes_sz;
-        let blocks_start = crate::index::layout::align_up(csizes_end, 32);
-        let blocks_sz    = n_blocks * std::mem::size_of::<VectorBlock>();
-        let labels_start = blocks_start + blocks_sz;
-        let total        = labels_start + n_padded;
+        let hdr_size       = std::mem::size_of::<IndexHeader>();
+        let centroids_sz   = nlist as usize * N_DIMS * 4;
+        let csizes_sz      = nlist as usize * 4;
+        let csizes_end     = hdr_size + centroids_sz + csizes_sz;
+        let bbox_start     = align_up(csizes_end, 32);
+        let bbox_sz        = nlist as usize * std::mem::size_of::<Bbox>();
+        let bbox_end       = bbox_start + 2 * bbox_sz;
+        let blocks_start   = align_up(bbox_end, 32);
+        let blocks_sz      = n_blocks * std::mem::size_of::<VectorBlock>();
+        let labels_start   = blocks_start + blocks_sz;
+        let total          = labels_start + n_padded;
 
-        // VectorBlock backing for 32-byte alignment.
-        let n_vb = crate::index::layout::align_up(total, std::mem::size_of::<VectorBlock>())
+        let n_vb = align_up(total, std::mem::size_of::<VectorBlock>())
             / std::mem::size_of::<VectorBlock>();
         let mut backing: Vec<VectorBlock> = vec![VectorBlock::default(); n_vb];
 
@@ -310,17 +271,14 @@ mod tests {
             let buf: &mut [u8] = bytemuck::cast_slice_mut(&mut backing);
 
             let header = IndexHeader {
-                magic:     MAGIC,
-                version:   VERSION,
+                magic: MAGIC,
+                version: VERSION,
                 nlist,
-                nprobe:    1,
+                nprobe: 1,
                 n_vectors: n_padded as u64,
-                _padding:  [0u8; 8],
+                _padding: [0u8; 8],
             };
             buf[..hdr_size].copy_from_slice(bytes_of(&header));
-
-            // Centroid at all-zeros
-            // (centroids bytes already zero from default)
 
             // cluster_sizes[0] = n_padded
             let csizes_off = hdr_size + centroids_sz;
@@ -328,7 +286,20 @@ mod tests {
                 bytemuck::cast_slice_mut(&mut buf[csizes_off..csizes_off + csizes_sz]);
             csizes[0] = n_padded as u32;
 
-            // Fill blocks: vector[i] has dims[0] = quantize_i16(i as f32 / 100.0), rest 0
+            // Bbox: dim 0 in [0, quantize_i16((n_per_cluster-1) / 100.0)], rest 0.
+            // This matches the per-slot values written below (vector i has
+            // data[0,slot=i] = quantize_i16(i / 100.0)). split_at_mut keeps the
+            // borrow checker happy when writing two non-overlapping bbox arrays.
+            let (mins_buf, rest) = buf[bbox_start..bbox_start + 2 * bbox_sz].split_at_mut(bbox_sz);
+            let bbox_mins:  &mut [Bbox] = bytemuck::cast_slice_mut(mins_buf);
+            let bbox_maxes: &mut [Bbox] = bytemuck::cast_slice_mut(rest);
+            bbox_mins[0].data = [0; 16];
+            bbox_maxes[0].data = [0; 16];
+            if n_per_cluster > 0 {
+                bbox_maxes[0].data[0] = quantize_i16((n_per_cluster - 1) as f32 / 100.0);
+            }
+
+            // Vector data: vector[i] has data[dim=0, slot=i] = quantize_i16(i / 100).
             let blocks: &mut [VectorBlock] =
                 bytemuck::cast_slice_mut(&mut buf[blocks_start..blocks_start + blocks_sz]);
             for slot in 0..n_padded {
@@ -338,7 +309,7 @@ mod tests {
                 blocks[block_idx].data[0 * BLOCK_SIZE + slot_in_block] = val;
             }
 
-            // Labels: alternating fraud(1) / legit(0)
+            // Labels: alternate fraud(1) / legit(0)
             for (i, label) in buf[labels_start..labels_start + n_padded].iter_mut().enumerate() {
                 *label = (i % 2) as u8;
             }
@@ -368,17 +339,14 @@ mod tests {
     #[test]
     fn fraud_score_uses_top5_ratio() {
         let tmp = unique_tmp_file("tiny-ivf-index-score");
-        // 8 vectors: labels 1,0,1,0,1,0,1,0 → 4 fraud, 4 legit
         build_tiny_index_file(&tmp, 8);
 
         let index = IvfIndex::load(&tmp).expect("must load tiny index");
         let query = [0.0f32; N_DIMS];
         let score = index.fraud_score(&query);
 
-        // With k=5 neighbours from 8 vectors alternating fraud/legit:
-        // nearest 5 from [0;14]: slots 0,1,2,3,4 → labels 1,0,1,0,1 → 3 frauds
-        // full_nprobe also returns same cluster → same result
-        // But exact count depends on distances, just check it's a valid ratio
+        // 8 vectors alternate fraud(1)/legit(0); nearest 5 from [0;14] are slots
+        // 0..4 with labels 1,0,1,0,1 → 3 frauds → 0.6.
         assert!(score >= 0.0 && score <= 1.0, "score {score} out of range [0,1]");
         assert!(score * 5.0 == (score * 5.0).round(), "score {score} not a multiple of 0.2");
 

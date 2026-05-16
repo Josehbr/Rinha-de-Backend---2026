@@ -1,6 +1,6 @@
 use std::collections::BinaryHeap;
 
-use crate::index::layout::{BLOCK_SIZE, N_DIMS, VectorBlock};
+use crate::index::layout::{BBOX_LANES, BLOCK_SIZE, Bbox, N_DIMS, VectorBlock};
 use crate::index::simd::scan_block;
 
 // ── Top5 ──────────────────────────────────────────────────────────────────────
@@ -316,6 +316,84 @@ fn sort_by_dist(indices: &mut [usize], dists: &mut [f32], len: usize) {
     }
 }
 
+// ── Bbox lower-bound (cluster pruning) ────────────────────────────────────────
+
+/// Expands a 14-dim query to 16 lanes for AVX2 bbox-distance kernels.
+///
+/// Lanes 14 and 15 are zero so they collapse to zero contribution in the kernel
+/// when paired with the zero-padded bbox slots (`build_bboxes` enforces this).
+#[inline]
+pub fn query_to_bbox_lanes(query_i16: &[i16; N_DIMS]) -> [i16; BBOX_LANES] {
+    let mut out = [0i16; BBOX_LANES];
+    out[..N_DIMS].copy_from_slice(query_i16);
+    out
+}
+
+/// Squared-L2 lower bound from `query` to the axis-aligned box `[bmin, bmax]`.
+///
+/// For each dim, the per-axis contribution is `max(0, max(q-bmax, bmin-q))²`.
+/// AVX2 path uses `_mm256_madd_epi16` to sum 16 i16² pairs into 8 i32 lanes.
+/// Output is f32 to match `scan_block` distance scale.
+#[inline]
+pub fn bbox_lower_bound(q_lanes: &[i16; BBOX_LANES], bmin: &Bbox, bmax: &Bbox) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { bbox_lower_bound_avx2(q_lanes, bmin, bmax) };
+        }
+    }
+    bbox_lower_bound_scalar(q_lanes, bmin, bmax)
+}
+
+#[inline]
+pub fn bbox_lower_bound_scalar(q_lanes: &[i16; BBOX_LANES], bmin: &Bbox, bmax: &Bbox) -> f32 {
+    let mut sum: i64 = 0;
+    for d in 0..BBOX_LANES {
+        let q = q_lanes[d] as i32;
+        let lo = bmin.data[d] as i32;
+        let hi = bmax.data[d] as i32;
+        let below = (lo - q).max(0);
+        let above = (q - hi).max(0);
+        let delta = below.max(above) as i64;
+        sum += delta * delta;
+    }
+    sum as f32
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bbox_lower_bound_avx2(q_lanes: &[i16; BBOX_LANES], bmin: &Bbox, bmax: &Bbox) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let q  = _mm256_loadu_si256(q_lanes.as_ptr() as *const __m256i);
+        let lo = _mm256_loadu_si256(bmin.data.as_ptr() as *const __m256i);
+        let hi = _mm256_loadu_si256(bmax.data.as_ptr() as *const __m256i);
+
+        // `subs_epi16` saturates so we never wrap; pair with `max_epi16(_, 0)`
+        // to clamp the wrong sign — at most one of the two diffs is positive.
+        let zero    = _mm256_setzero_si256();
+        let below   = _mm256_max_epi16(_mm256_subs_epi16(lo, q), zero);
+        let above   = _mm256_max_epi16(_mm256_subs_epi16(q, hi), zero);
+        let delta   = _mm256_max_epi16(below, above);
+
+        // delta² summed pair-wise: 16 i16 → 8 i32. Max possible value per lane is
+        // 20_000² = 4·10⁸; summed across 14 lanes max 5.6·10⁹ → must widen to i64.
+        let sq      = _mm256_madd_epi16(delta, delta);   // [8 × i32]
+        let sq_lo   = _mm256_castsi256_si128(sq);
+        let sq_hi   = _mm256_extracti128_si256(sq, 1);
+        let lo64    = _mm256_cvtepi32_epi64(sq_lo);      // [4 × i64]
+        let hi64    = _mm256_cvtepi32_epi64(sq_hi);
+        let sum64   = _mm256_add_epi64(lo64, hi64);      // [4 × i64]
+        let s_lo    = _mm256_castsi256_si128(sum64);
+        let s_hi    = _mm256_extracti128_si256(sum64, 1);
+        let s       = _mm_add_epi64(s_lo, s_hi);          // [2 × i64]
+        let s2      = _mm_add_epi64(s, _mm_unpackhi_epi64(s, s));
+        let total   = _mm_cvtsi128_si64(s2);
+
+        total as f32
+    }
+}
+
 // ── Hot-path block scan (uses Top5) ──────────────────────────────────────────
 
 /// Scans VectorBlocks for the hot path, updating `top5` in place.
@@ -443,6 +521,100 @@ mod tests {
         let (dist, label) = heap.pop().unwrap();
         assert_eq!(dist.0, 0.0, "nearest vector has dist 0");
         assert_eq!(label, 0, "nearest vector is slot 0 → label 0");
+    }
+
+    #[test]
+    fn bbox_lower_bound_zero_when_query_inside_box() {
+        // Box [1000, 2000] in dim 0; query at 1500 → contribution 0 in dim 0.
+        // Other dims have box=[0,0] and query=0 → contribution 0.
+        let mut bmin = Bbox::default(); bmin.data[0] = 1000;
+        let mut bmax = Bbox::default(); bmax.data[0] = 2000;
+        let q = {
+            let mut q = [0i16; BBOX_LANES];
+            q[0] = 1500;
+            q
+        };
+        assert_eq!(bbox_lower_bound_scalar(&q, &bmin, &bmax), 0.0);
+        assert_eq!(bbox_lower_bound(&q, &bmin, &bmax), 0.0);
+    }
+
+    #[test]
+    fn bbox_lower_bound_matches_expected_when_query_outside() {
+        // Box dim 0 in [1000, 2000], query at 500 → delta=500 → sq=250_000
+        // Box dim 1 in [-100, 100], query at 300 → delta=200 → sq=40_000
+        // Total = 290_000
+        let mut bmin = Bbox::default();
+        bmin.data[0] = 1000;
+        bmin.data[1] = -100;
+        let mut bmax = Bbox::default();
+        bmax.data[0] = 2000;
+        bmax.data[1] = 100;
+        let mut q = [0i16; BBOX_LANES];
+        q[0] = 500;
+        q[1] = 300;
+        let scalar = bbox_lower_bound_scalar(&q, &bmin, &bmax);
+        let avx2 = bbox_lower_bound(&q, &bmin, &bmax);
+        assert_eq!(scalar, 290_000.0);
+        assert_eq!(avx2, 290_000.0);
+    }
+
+    #[test]
+    fn bbox_lower_bound_avx2_matches_scalar_under_stress() {
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+        use rand::Rng;
+
+        let mut rng = SmallRng::seed_from_u64(123);
+        for _ in 0..200 {
+            let mut bmin = Bbox::default();
+            let mut bmax = Bbox::default();
+            let mut q = [0i16; BBOX_LANES];
+            for d in 0..N_DIMS {
+                let a: i16 = rng.random_range(-10_000..=10_000);
+                let b: i16 = rng.random_range(-10_000..=10_000);
+                bmin.data[d] = a.min(b);
+                bmax.data[d] = a.max(b);
+                q[d] = rng.random_range(-10_000..=10_000);
+            }
+            let s = bbox_lower_bound_scalar(&q, &bmin, &bmax);
+            let v = bbox_lower_bound(&q, &bmin, &bmax);
+            assert_eq!(s, v, "scalar vs avx2 mismatch: bmin={:?} bmax={:?} q={:?}", bmin.data, bmax.data, q);
+        }
+    }
+
+    #[test]
+    fn bbox_lower_bound_is_actual_lower_bound() {
+        // For a real vector inside the box, the L2² distance from query to that
+        // vector must be ≥ the bbox lower bound. Stress with many random boxes
+        // and queries; pick the vector as the box centre.
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+        use rand::Rng;
+
+        let mut rng = SmallRng::seed_from_u64(456);
+        for _ in 0..200 {
+            let mut bmin = Bbox::default();
+            let mut bmax = Bbox::default();
+            let mut q = [0i16; BBOX_LANES];
+            let mut centre = [0i16; N_DIMS];
+            for d in 0..N_DIMS {
+                let a: i16 = rng.random_range(-10_000..=10_000);
+                let b: i16 = rng.random_range(-10_000..=10_000);
+                let (lo, hi) = (a.min(b), a.max(b));
+                bmin.data[d] = lo;
+                bmax.data[d] = hi;
+                centre[d] = ((lo as i32 + hi as i32) / 2) as i16;
+                q[d] = rng.random_range(-10_000..=10_000);
+            }
+            let lb = bbox_lower_bound(&q, &bmin, &bmax);
+            // Real distance to centre
+            let mut real: f32 = 0.0;
+            for d in 0..N_DIMS {
+                let diff = (centre[d] as f32) - (q[d] as f32);
+                real += diff * diff;
+            }
+            assert!(lb <= real + 1.0, "bbox lb {lb} > real dist {real}");
+        }
     }
 
     #[test]

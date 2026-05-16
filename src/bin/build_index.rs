@@ -15,7 +15,7 @@ use serde::Deserializer;
 use serde::de::{SeqAccess, Visitor};
 
 use index::IvfIndex;
-use index::layout::{BLOCK_SIZE, IndexHeader, MAGIC, N_DIMS, VERSION, VectorBlock};
+use index::layout::{BBOX_LANES, BLOCK_SIZE, Bbox, IndexHeader, MAGIC, N_DIMS, VERSION, VectorBlock};
 use index::quantize::quantize_i16;
 
 const INPUT_PATH: &str = "resources/references.json.gz";
@@ -88,10 +88,15 @@ fn main() -> Result<()> {
         n_vectors_padded
     );
 
+    println!("[build] computando bbox por cluster (i16 quantizado)...");
+    let (bbox_mins, bbox_maxes) = build_bboxes(&sorted_vectors, &cluster_sizes_raw);
+
     serialize_index(
         Path::new(OUTPUT_PATH),
         &centroids,
         &cluster_sizes_padded,
+        &bbox_mins,
+        &bbox_maxes,
         &blocks,
         &labels_padded,
         n_vectors_padded,
@@ -157,10 +162,60 @@ fn build_blocks(
     (blocks, padded_sizes, padded_labels)
 }
 
+/// Computes per-cluster bounding boxes in quantized i16 space.
+///
+/// Returns `(bbox_mins, bbox_maxes)`, both indexed by cluster_id. Each Bbox
+/// is `[i16; 16]` with the trailing 2 lanes set to 0 so they contribute zero
+/// to the squared-distance lower bound regardless of query values.
+///
+/// Computed on the **raw** (un-padded) vectors so padding slots don't widen
+/// the box and weaken pruning.
+fn build_bboxes(
+    sorted_vectors: &[[f32; N_DIMS]],
+    cluster_sizes_raw: &[usize],
+) -> (Vec<Bbox>, Vec<Bbox>) {
+    let nlist = cluster_sizes_raw.len();
+    let mut mins = vec![Bbox::default(); nlist];
+    let mut maxes = vec![Bbox::default(); nlist];
+
+    let mut offset = 0usize;
+    for (ci, &count) in cluster_sizes_raw.iter().enumerate() {
+        if count == 0 {
+            // Empty cluster: use a degenerate box at the origin. It will always
+            // produce a non-negative lower bound for any query, and the cluster
+            // has no real vectors to scan anyway.
+            offset += count;
+            continue;
+        }
+        let mut lo = [i16::MAX; BBOX_LANES];
+        let mut hi = [i16::MIN; BBOX_LANES];
+        for v in &sorted_vectors[offset..offset + count] {
+            for d in 0..N_DIMS {
+                let q = quantize_i16(v[d]);
+                if q < lo[d] { lo[d] = q; }
+                if q > hi[d] { hi[d] = q; }
+            }
+        }
+        // Trailing lanes: keep 0 so (q - 0) and (0 - q) are mirrored by max-with-0
+        // in the lower-bound kernel — both clamp to 0 contribution.
+        for d in N_DIMS..BBOX_LANES {
+            lo[d] = 0;
+            hi[d] = 0;
+        }
+        mins[ci].data = lo;
+        maxes[ci].data = hi;
+        offset += count;
+    }
+
+    (mins, maxes)
+}
+
 fn serialize_index(
     output_path: &Path,
     centroids: &[[f32; N_DIMS]],
     cluster_sizes: &[u32],
+    bbox_mins: &[Bbox],
+    bbox_maxes: &[Bbox],
     blocks: &[VectorBlock],
     labels: &[u8],
     n_vectors: u64,
@@ -170,6 +225,13 @@ fn serialize_index(
         "centroids/cluster_sizes: {} vs {}",
         centroids.len(),
         cluster_sizes.len()
+    );
+    ensure!(
+        bbox_mins.len() == centroids.len() && bbox_maxes.len() == centroids.len(),
+        "bbox arrays must equal nlist: mins={} maxes={} nlist={}",
+        bbox_mins.len(),
+        bbox_maxes.len(),
+        centroids.len(),
     );
 
     let header = IndexHeader {
@@ -184,9 +246,15 @@ fn serialize_index(
     let hdr_size = std::mem::size_of::<IndexHeader>();
     let centroids_bytes = cast_slice::<[f32; N_DIMS], u8>(centroids);
     let cluster_sizes_bytes = cast_slice::<u32, u8>(cluster_sizes);
-    let fixed_end = hdr_size + centroids_bytes.len() + cluster_sizes_bytes.len();
-    let blocks_start = align_up(fixed_end, 32); // VectorBlock requires align(32)
-    let pad_len = blocks_start - fixed_end;
+    let bbox_mins_bytes = cast_slice::<Bbox, u8>(bbox_mins);
+    let bbox_maxes_bytes = cast_slice::<Bbox, u8>(bbox_maxes);
+
+    let csizes_end = hdr_size + centroids_bytes.len() + cluster_sizes_bytes.len();
+    let bbox_start = align_up(csizes_end, 32); // Bbox requires align(32)
+    let pad_csizes = bbox_start - csizes_end;
+    let bbox_end = bbox_start + bbox_mins_bytes.len() + bbox_maxes_bytes.len();
+    let blocks_start = align_up(bbox_end, 32); // VectorBlock requires align(32)
+    let pad_bbox = blocks_start - bbox_end;
 
     let file = File::create(output_path)
         .with_context(|| format!("falha ao criar {}", output_path.display()))?;
@@ -195,16 +263,22 @@ fn serialize_index(
     writer.write_all(bytes_of(&header))?;
     writer.write_all(centroids_bytes)?;
     writer.write_all(cluster_sizes_bytes)?;
-    if pad_len > 0 {
-        writer.write_all(&vec![0u8; pad_len])?;
+    if pad_csizes > 0 {
+        writer.write_all(&vec![0u8; pad_csizes])?;
+    }
+    writer.write_all(bbox_mins_bytes)?;
+    writer.write_all(bbox_maxes_bytes)?;
+    if pad_bbox > 0 {
+        writer.write_all(&vec![0u8; pad_bbox])?;
     }
     writer.write_all(cast_slice::<VectorBlock, u8>(blocks))?;
     writer.write_all(labels)?;
     writer.flush()?;
 
     println!(
-        "[build] serializado: {} centroids, {} blocks, {} vectors (padded)",
+        "[build] serializado: {} centroids, {} clusters bbox, {} blocks, {} vectors (padded)",
         centroids.len(),
+        bbox_mins.len(),
         blocks.len(),
         n_vectors,
     );
@@ -422,6 +496,36 @@ mod tests {
         }
         for i in 3..8 {
             assert_eq!(padded_labels[i], 0, "pad slot {i}");
+        }
+    }
+
+    #[test]
+    fn build_bboxes_tight_around_real_vectors() {
+        use index::quantize::quantize_i16;
+        // cluster 0: 3 vectors with first dim 0.1, 0.3, 0.5
+        // cluster 1: 2 vectors with first dim 0.7, 0.9
+        let vectors: Vec<[f32; N_DIMS]> = vec![
+            { let mut v = [0.0; N_DIMS]; v[0] = 0.1; v },
+            { let mut v = [0.0; N_DIMS]; v[0] = 0.3; v },
+            { let mut v = [0.0; N_DIMS]; v[0] = 0.5; v },
+            { let mut v = [0.0; N_DIMS]; v[0] = 0.7; v },
+            { let mut v = [0.0; N_DIMS]; v[0] = 0.9; v },
+        ];
+        let cluster_sizes = vec![3usize, 2usize];
+        let (mins, maxes) = build_bboxes(&vectors, &cluster_sizes);
+
+        assert_eq!(mins.len(), 2);
+        assert_eq!(maxes.len(), 2);
+        // Cluster 0: dim 0 in [0.1, 0.5]
+        assert_eq!(mins[0].data[0], quantize_i16(0.1));
+        assert_eq!(maxes[0].data[0], quantize_i16(0.5));
+        // Cluster 1: dim 0 in [0.7, 0.9]
+        assert_eq!(mins[1].data[0], quantize_i16(0.7));
+        assert_eq!(maxes[1].data[0], quantize_i16(0.9));
+        // Pad lanes are zero
+        for d in N_DIMS..BBOX_LANES {
+            assert_eq!(mins[0].data[d], 0);
+            assert_eq!(maxes[0].data[d], 0);
         }
     }
 
