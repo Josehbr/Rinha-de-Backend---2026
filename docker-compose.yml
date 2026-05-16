@@ -1,8 +1,14 @@
 services:
-  nginx:
-    image: nginx:1.27-alpine
+  lb:
+    # The image bundles both fraud-api (default CMD) and fraud-lb. We override
+    # the command here so the LB process runs instead of the API.
+    image: josehbr/fraud-api:v8
+    command: ["./fraud-lb"]
+    environment:
+      - RUST_LOG=warn
+      - LB_LISTEN=0.0.0.0:9999
+      - LB_API_SOCKS=/sockets/api1.ctrl,/sockets/api2.ctrl
     volumes:
-      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
       - sockets:/sockets
     ports:
       - "9999:9999"
@@ -14,21 +20,26 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.2"
+          cpus: "0.16"
           memory: "20MB"
 
   api1:
-    image: josehbr/fraud-api:v7
+    image: josehbr/fraud-api:v8
     restart: on-failure
     volumes:
       - sockets:/sockets
     environment:
       - RUST_LOG=warn
-      - BIND_UDS=/sockets/api1.sock
-      - NPROBE=24
-      - FULL_NPROBE=72
+      - CTRL_UDS=/sockets/api1.ctrl
+    ulimits:
+      # Allow mlockall + MAP_POPULATE on the 84MB index without EAGAIN.
+      # Best-effort: if the Rinha runner ignores ulimits the API still boots
+      # (mlockall is `let _ = ...` — falling back silently).
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
-      test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api1.sock"]
+      test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api1.ctrl"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -36,21 +47,23 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
-          memory: "160MB"
+          cpus: "0.42"
+          memory: "165MB"
 
   api2:
-    image: josehbr/fraud-api:v7
+    image: josehbr/fraud-api:v8
     restart: on-failure
     volumes:
       - sockets:/sockets
     environment:
       - RUST_LOG=warn
-      - BIND_UDS=/sockets/api2.sock
-      - NPROBE=24
-      - FULL_NPROBE=72
+      - CTRL_UDS=/sockets/api2.ctrl
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
-      test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api2.sock"]
+      test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api2.ctrl"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -58,8 +71,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
-          memory: "160MB"
+          cpus: "0.42"
+          memory: "165MB"
 
 volumes:
   sockets:
@@ -68,4 +81,7 @@ volumes:
       type: tmpfs
       device: tmpfs
 
-# Totais: 1.0 CPU, 340 MB — dentro do limite da Rinha (1.0 CPU, 350 MB)
+# Totais: 1.0 CPU / 350 MB — dentro do limite da Rinha
+#   lb   : 0.16 CPU /  20 MB  (TCP→UDS via SCM_RIGHTS, sem parse de HTTP)
+#   api1 : 0.42 CPU / 165 MB
+#   api2 : 0.42 CPU / 165 MB
