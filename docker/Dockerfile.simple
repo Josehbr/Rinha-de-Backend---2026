@@ -23,7 +23,7 @@ COPY src ./src
 
 # Força rebuild dos binários reais
 RUN touch src/main.rs src/bin/build_index.rs && \
-    cargo build --release --target x86_64-unknown-linux-musl --bin fraud-api --bin build-index
+    cargo build --release --target x86_64-unknown-linux-musl --bin fraud-api --bin fraud-lb --bin build-index
 
 # ── Stage 2: builder do índice ────────────────────────────────────────────────
 FROM debian:bookworm-slim AS index-builder
@@ -45,6 +45,7 @@ FROM scratch
 WORKDIR /app
 
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/fraud-api ./
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/fraud-lb ./
 COPY --from=index-builder /app/index.bin ./
 COPY resources/mcc_risk.json ./resources/
 COPY --from=healthcheck-tools /bin/busybox /bin/busybox

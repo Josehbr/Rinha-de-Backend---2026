@@ -3,14 +3,15 @@ mod models;
 mod vectorizer;
 
 use std::env;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use index::IvfIndex;
 use models::MccRisk;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
@@ -87,38 +88,110 @@ fn main() {
     rt.block_on(server_loop(state));
 }
 
-// ── Server accept loop ────────────────────────────────────────────────────────
+// ── Control-socket server: receives accepted TCP fds from fraud-lb ────────────
 
 async fn server_loop(state: Arc<AppState>) {
-    let uds_path = env::var("BIND_UDS").unwrap_or_else(|_| {
-        let port = env::var("PORT").unwrap_or_else(|_| "9998".into());
-        format!("/tmp/fraud-api-{port}.sock")
-    });
+    let ctrl_path = env::var("CTRL_UDS").unwrap_or_else(|_| "/sockets/api1.ctrl".into());
 
-    let _ = std::fs::remove_file(&uds_path);
-    let listener = UnixListener::bind(&uds_path)
-        .unwrap_or_else(|e| panic!("falha ao bind {uds_path}: {e}"));
+    let _ = std::fs::remove_file(&ctrl_path);
+    let listener = UnixListener::bind(&ctrl_path)
+        .unwrap_or_else(|e| panic!("falha ao bind {ctrl_path}: {e}"));
 
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(
-        &uds_path,
+        &ctrl_path,
         std::fs::Permissions::from_mode(0o666),
     );
 
+    // The LB connects exactly once at boot and keeps the socket open for the
+    // process lifetime. If it ever disconnects (crash/restart), we loop back
+    // and accept a fresh connection — the same control socket file persists.
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
-                let state = state.clone();
-                tokio::spawn(handle_conn(stream, state));
+            Ok((lb_conn, _)) => {
+                recv_fds_loop(lb_conn, state.clone()).await;
+                warn!("LB connection closed; awaiting reconnect");
             }
-            Err(e) => warn!("accept error: {e}"),
+            Err(e) => warn!("ctrl accept error: {e}"),
         }
     }
 }
 
-// ── Per-connection keepalive handler ──────────────────────────────────────────
+/// Reads client fds from the LB control socket and spawns one task per fd.
+///
+/// Returns when the LB closes its side of the control socket — the outer
+/// `server_loop` will then accept a new LB connection on the same path.
+async fn recv_fds_loop(lb_conn: UnixStream, state: Arc<AppState>) {
+    loop {
+        match recv_fd_async(&lb_conn).await {
+            Ok(fd) => {
+                // SAFETY: the LB just transferred ownership of `fd` to us via
+                // SCM_RIGHTS; the kernel guarantees it's a valid open file.
+                let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+                if let Err(e) = std_stream.set_nonblocking(true) {
+                    warn!("set_nonblocking failed: {e}");
+                    continue;
+                }
+                match TcpStream::from_std(std_stream) {
+                    Ok(tcp) => {
+                        let _ = tcp.set_nodelay(true);
+                        let state = state.clone();
+                        tokio::spawn(handle_conn(tcp, state));
+                    }
+                    Err(e) => warn!("TcpStream::from_std: {e}"),
+                }
+            }
+            Err(e) => {
+                warn!("recv_fd: {e}");
+                return;
+            }
+        }
+    }
+}
 
-async fn handle_conn(mut stream: UnixStream, state: Arc<AppState>) {
+/// Awaits readiness on the control socket and pulls one fd out of an
+/// `SCM_RIGHTS` ancillary message via blocking `recvmsg`.
+async fn recv_fd_async(stream: &UnixStream) -> std::io::Result<RawFd> {
+    loop {
+        stream.readable().await?;
+        match stream.try_io(Interest::READABLE, || recv_fd_sync(stream.as_raw_fd())) {
+            Ok(fd) => return Ok(fd),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn recv_fd_sync(socket_fd: RawFd) -> std::io::Result<RawFd> {
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+
+    let mut payload = [0u8; 16];
+    let mut iov = [std::io::IoSliceMut::new(&mut payload)];
+    let mut cmsg_space = nix::cmsg_space!([RawFd; 1]);
+    let msg = recvmsg::<()>(socket_fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty())
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    if msg.bytes == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "LB closed control socket",
+        ));
+    }
+    for cm in msg
+        .cmsgs()
+        .map_err(|e| std::io::Error::other(format!("cmsg parse: {e}")))?
+    {
+        if let ControlMessageOwned::ScmRights(fds) = cm {
+            if let Some(&fd) = fds.first() {
+                return Ok(fd);
+            }
+        }
+    }
+    Err(std::io::Error::other("no fd in SCM_RIGHTS cmsg"))
+}
+
+// ── Per-connection keepalive handler (now over TcpStream) ────────────────────
+
+async fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) {
     let mut accum: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk_buf = [0u8; 4096]; // stack buffer — evita malloc por chunk
 

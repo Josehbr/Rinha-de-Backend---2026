@@ -11,9 +11,15 @@ path = "src/main.rs"
 name = "build-index"
 path = "src/bin/build_index.rs"
 
+[[bin]]
+# Minimal TCP→UDS LB that hands accepted client FDs to api1/api2 via
+# SCM_RIGHTS. Substitui nginx no path nginx→api: zero parse, zero proxy de bytes.
+name = "fraud-lb"
+path = "src/bin/fraud_lb.rs"
+
 [dependencies]
 # HTTP runtime — single-threaded tokio, suporte nativo a UDS
-tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }
 
 # Lightweight HTTP/1.1 request parser (zero-copy, zero alloc)
 httparse = "1.10.1"
@@ -47,6 +53,11 @@ memmap2 = "0.9"
 # madvise(HUGEPAGE | WILLNEED) + mlockall — corta page-faults soft no path quente.
 # Top 10 inteiro usa: MXLange #1, Ronie #2, atomos #4, macedot #8, itagyba #10.
 libc = "0.2"
+
+# SCM_RIGHTS fd-passing entre fraud-lb e fraud-api: LB faz accept(), API
+# recebe o fd TCP pronto e adopta como tokio::net::TcpStream — elimina
+# parse HTTP/proxy de bytes pelo balanceador. 9/9 top 10 usam essa técnica.
+nix = { version = "0.30", default-features = false, features = ["socket", "uio"] }
 
 [profile.release]
 opt-level = 3
