@@ -28,9 +28,13 @@ services:
     environment:
       - RUST_LOG=warn
       - BIND_UDS=/sockets/api1.sock
-      - NPROBE=${NPROBE:-8}
-      - FULL_NPROBE=${FULL_NPROBE:-24}
-      - WORKERS=${WORKERS:-1}
+    ulimits:
+      # Allow mlockall + MAP_POPULATE on the 84MB index without EAGAIN.
+      # Best-effort: if the Rinha bot strips this, the API still boots
+      # (mlockall is a let _ = ... no-op on failure).
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
       test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api1.sock"]
       interval: 5s
@@ -51,9 +55,10 @@ services:
     environment:
       - RUST_LOG=warn
       - BIND_UDS=/sockets/api2.sock
-      - NPROBE=${NPROBE:-8}
-      - FULL_NPROBE=${FULL_NPROBE:-24}
-      - WORKERS=${WORKERS:-1}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
       test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api2.sock"]
       interval: 5s

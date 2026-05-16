@@ -45,31 +45,16 @@ static HTTP_404: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 fn main() {
     init_tracing();
 
-    // mlockall prevents the resident pages from being paged out under memory
-    // pressure — protects against jitter on the index pages. Best-effort
-    // (kernel may deny without CAP_IPC_LOCK; harmless if it fails).
-    unsafe {
-        let _ = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
-    }
-
     let index_path    = env::var("INDEX_PATH").unwrap_or_else(|_| "./index.bin".into());
     let mcc_risk_path = env::var("MCC_RISK_PATH")
         .unwrap_or_else(|_| "./resources/mcc_risk.json".into());
 
-    let loaded_index = IvfIndex::load(std::path::Path::new(&index_path))
-        .with_context(|| format!("falha ao carregar {index_path}"))
-        .map_err(|e| { warn!("{e}"); e })
-        .expect("índice indisponível");
-
-    let nprobe_fast = env::var("NPROBE").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0);
-    let nprobe_full = env::var("FULL_NPROBE").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0);
-
-    let index = Arc::new(match (nprobe_fast, nprobe_full) {
-        (Some(f), Some(fu)) => loaded_index.with_nprobes(f, fu),
-        (Some(f), None)     => loaded_index.with_nprobes(f, f * 3),
-        (None, Some(fu))    => { let f = loaded_index.nprobe(); loaded_index.with_nprobes(f, fu) }
-        (None, None)        => loaded_index,
-    });
+    let index = Arc::new(
+        IvfIndex::load(std::path::Path::new(&index_path))
+            .with_context(|| format!("falha ao carregar {index_path}"))
+            .map_err(|e| { warn!("{e}"); e })
+            .expect("índice indisponível"),
+    );
 
     let mcc_risk = Arc::new(
         MccRisk::load(std::path::Path::new(&mcc_risk_path))
@@ -77,8 +62,16 @@ fn main() {
             .expect("mcc_risk indisponível"),
     );
 
-    // 5000 queries: enough to drag the centroids and a representative slice of
-    // VectorBlocks into L1/L2 cache, plus exercises both nprobe paths.
+    // mlockall AFTER mmap so MCL_CURRENT only locks what's already resident —
+    // avoids EAGAIN when MAP_POPULATE pre-faults pages while a global memlock
+    // limit (RLIMIT_MEMLOCK) is in effect. Best-effort: silently ignored if
+    // the container lacks CAP_IPC_LOCK or has a memlock ulimit too low.
+    unsafe {
+        let _ = libc::mlockall(libc::MCL_CURRENT);
+    }
+
+    // 5000 queries: enough to drag the bbox arrays + a representative slice of
+    // VectorBlocks into L1/L2, plus exercises the sort-and-prune hot path.
     warmup_index(&index, 5000);
     READY.store(true, Ordering::Release);
 
