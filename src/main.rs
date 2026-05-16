@@ -45,6 +45,13 @@ static HTTP_404: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 fn main() {
     init_tracing();
 
+    // mlockall prevents the resident pages from being paged out under memory
+    // pressure — protects against jitter on the index pages. Best-effort
+    // (kernel may deny without CAP_IPC_LOCK; harmless if it fails).
+    unsafe {
+        let _ = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
+    }
+
     let index_path    = env::var("INDEX_PATH").unwrap_or_else(|_| "./index.bin".into());
     let mcc_risk_path = env::var("MCC_RISK_PATH")
         .unwrap_or_else(|_| "./resources/mcc_risk.json".into());
@@ -70,7 +77,9 @@ fn main() {
             .expect("mcc_risk indisponível"),
     );
 
-    warmup_index(&index, 200);
+    // 5000 queries: enough to drag the centroids and a representative slice of
+    // VectorBlocks into L1/L2 cache, plus exercises both nprobe paths.
+    warmup_index(&index, 5000);
     READY.store(true, Ordering::Release);
 
     let state = Arc::new(AppState { index, mcc_risk });

@@ -113,6 +113,7 @@ dependencies = [
  "bytemuck",
  "flate2",
  "httparse",
+ "libc",
  "memmap2",
  "rand",
  "rayon",

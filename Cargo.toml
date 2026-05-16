@@ -44,6 +44,10 @@ rand = "0.9"
 # mmap read-only compartilhado entre as duas instâncias de API
 memmap2 = "0.9"
 
+# madvise(HUGEPAGE | WILLNEED) + mlockall — corta page-faults soft no path quente.
+# Top 10 inteiro usa: MXLange #1, Ronie #2, atomos #4, macedot #8, itagyba #10.
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

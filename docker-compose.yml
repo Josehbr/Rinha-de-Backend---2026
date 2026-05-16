@@ -28,8 +28,8 @@ services:
     environment:
       - RUST_LOG=warn
       - BIND_UDS=/sockets/api1.sock
-      - NPROBE=${NPROBE:-24}
-      - FULL_NPROBE=${FULL_NPROBE:-72}
+      - NPROBE=${NPROBE:-8}
+      - FULL_NPROBE=${FULL_NPROBE:-24}
       - WORKERS=${WORKERS:-1}
     healthcheck:
       test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api1.sock"]
@@ -51,8 +51,8 @@ services:
     environment:
       - RUST_LOG=warn
       - BIND_UDS=/sockets/api2.sock
-      - NPROBE=${NPROBE:-24}
-      - FULL_NPROBE=${FULL_NPROBE:-72}
+      - NPROBE=${NPROBE:-8}
+      - FULL_NPROBE=${FULL_NPROBE:-24}
       - WORKERS=${WORKERS:-1}
     healthcheck:
       test: ["CMD", "/bin/busybox", "test", "-S", "/sockets/api2.sock"]

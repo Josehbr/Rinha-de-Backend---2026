@@ -45,6 +45,16 @@ impl IvfIndex {
         let mmap = unsafe { MmapOptions::new().populate().map(&file) }
             .with_context(|| format!("falha ao fazer mmap de {}", path.display()))?;
 
+        // HUGEPAGE cuts TLB misses to ~1/512 (2MB pages); WILLNEED warms the
+        // working set before the first request. Adopted by 5/9 top-10 entries
+        // (MXLange #1, Ronie #2, atomos #4, macedot #8, itagyba #10).
+        unsafe {
+            let ptr = mmap.as_ptr() as *mut libc::c_void;
+            let len = mmap.len();
+            libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+            libc::madvise(ptr, len, libc::MADV_WILLNEED);
+        }
+
         let parsed_layout = IndexLayout::from_bytes(&mmap)
             .with_context(|| format!("falha ao parsear layout de {}", path.display()))?;
 
@@ -93,8 +103,9 @@ impl IvfIndex {
     /// Computes fraud score as `frauds_in_top5 / 5.0`.
     ///
     /// Two-stage strategy: fast probe (nprobe clusters) first, then a full probe
-    /// (full_nprobe) only when the initial count lands in the ambiguous zone {2, 3}
-    /// where a single wrong vote flips the fraud decision.
+    /// (full_nprobe) when the initial count lands in {1, 2, 3, 4}. Only counts
+    /// 0 and 5 (unanimous) skip the full probe — every other case might be a
+    /// single wrong vote away from flipping the decision (atomos #4 also uses {2..4}).
     ///
     /// Uses `Top5` (sorted array) instead of `BinaryHeap` to avoid heap overhead.
     pub fn fraud_score(&self, query: &[f32; N_DIMS]) -> f32 {
@@ -103,7 +114,7 @@ impl IvfIndex {
         self.fill_top5(query, self.nprobe, &mut top5);
         let fast_frauds = top5.count_fraud();
 
-        let frauds = if fast_frauds == 2 || fast_frauds == 3 {
+        let frauds = if (1..=4).contains(&fast_frauds) {
             top5.clear();
             self.fill_top5(query, self.full_nprobe, &mut top5);
             top5.count_fraud()

@@ -65,22 +65,14 @@ unsafe fn scan_block_avx2(
             }};
         }
 
-        // First 4 dims: rotate through 4 accumulators (one dim each, breaks FMA chain).
+        // First 8 dims: rotate through 4 accumulators (breaks FMA dep chain).
+        // The @4 dims early-exit was removed: threshold is rarely tight enough at 4
+        // dims, so the check + branch cost more than it saves. jairoblatt-rust (#5,
+        // p99=1.03ms) and macedot-c (#8, p99=1.08ms) only check at 8 dims.
         acc_dim!(acc0, 0);
         acc_dim!(acc1, 1);
         acc_dim!(acc2, 2);
         acc_dim!(acc3, 3);
-
-        // Early exit @4 dims: check if ALL 8 slots already exceed threshold.
-        // 4 dimensions is enough to distinguish far blocks when Top5 threshold
-        // is tight (late clusters in the probe sequence).
-        let partial4 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-        let thresh_v = _mm256_set1_ps(threshold);
-        if _mm256_movemask_ps(_mm256_cmp_ps(partial4, thresh_v, _CMP_GT_OS)) == 0xFF {
-            return [f32::MAX; BLOCK_SIZE];
-        }
-
-        // Dims 4-7: rotate through 4 accumulators.
         acc_dim!(acc0, 4);
         acc_dim!(acc1, 5);
         acc_dim!(acc2, 6);
@@ -88,6 +80,7 @@ unsafe fn scan_block_avx2(
 
         // Early exit @8 dims on partial sum of all 4 accumulators.
         let partial = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        let thresh_v = _mm256_set1_ps(threshold);
         if _mm256_movemask_ps(_mm256_cmp_ps(partial, thresh_v, _CMP_GT_OS)) == 0xFF {
             return [f32::MAX; BLOCK_SIZE];
         }
