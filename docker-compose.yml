@@ -34,10 +34,14 @@ services:
     environment:
       - RUST_LOG=warn
       - CTRL_UDS=/sockets/api1.ctrl
+      - RINHA_RT_MODE=wakeup
+      - RINHA_CPU=0
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       # Allow mlockall + MAP_POPULATE on the 84MB index without EAGAIN.
-      # Best-effort: if the Rinha bot strips this, the API still boots
-      # (mlockall is a let _ = ... no-op on failure).
       memlock:
         soft: -1
         hard: -1
@@ -61,6 +65,12 @@ services:
     environment:
       - RUST_LOG=warn
       - CTRL_UDS=/sockets/api2.ctrl
+      - RINHA_RT_MODE=wakeup
+      - RINHA_CPU=2
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
     ulimits:
       memlock:
         soft: -1

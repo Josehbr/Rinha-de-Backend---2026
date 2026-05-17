@@ -3,23 +3,34 @@ mod models;
 mod vectorizer;
 
 use std::env;
+use std::io::{ErrorKind, IoSliceMut, Read, Write};
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Context;
 use index::IvfIndex;
 use models::MccRisk;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
-use tokio::net::{TcpStream, UnixListener, UnixStream};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 pub static READY: AtomicBool = AtomicBool::new(false);
 
+const WORKER_STACK_BYTES: usize = 256 * 1024;
+const WORKER_RT_PRIO: libc::c_int = 10;
+const READ_BUF_SIZE: usize = 4096;
+
 struct AppState {
-    index: Arc<IvfIndex>,
-    mcc_risk: Arc<MccRisk>,
+    index:           Arc<IvfIndex>,
+    mcc_risk:        Arc<MccRisk>,
+    /// When `true` and SCHED_FIFO was granted, workers stay at FIFO only while
+    /// blocked in `recv`. Compute+send runs as SCHED_OTHER so a busy worker
+    /// does not outrank softirqs / the test client. Mirrors Ronie #2.
+    rt_wakeup_only:  bool,
 }
 
 // ── Pre-rendered HTTP responses ───────────────────────────────────────────────
@@ -64,33 +75,40 @@ fn main() {
     );
 
     // mlockall AFTER mmap so MCL_CURRENT only locks what's already resident —
-    // avoids EAGAIN when MAP_POPULATE pre-faults pages while a global memlock
-    // limit (RLIMIT_MEMLOCK) is in effect. Best-effort: silently ignored if
-    // the container lacks CAP_IPC_LOCK or has a memlock ulimit too low.
+    // avoids EAGAIN when MAP_POPULATE pre-faults pages while a low RLIMIT_MEMLOCK
+    // is in effect. Best-effort: silently ignored if denied.
     unsafe {
         let _ = libc::mlockall(libc::MCL_CURRENT);
     }
 
-    // 5000 queries: enough to drag the bbox arrays + a representative slice of
-    // VectorBlocks into L1/L2, plus exercises the sort-and-prune hot path.
     warmup_index(&index, 5000);
     READY.store(true, Ordering::Release);
 
-    let state = Arc::new(AppState { index, mcc_risk });
+    // CPU affinity (best-effort): pin this process + future workers to a single
+    // core to avoid cross-core cache misses and reduce scheduler jitter.
+    set_cpu_affinity_from_env();
 
-    // Single-threaded tokio: no context-switch overhead between tasks.
-    // With 0.4 CPU, one thread handles all async I/O cooperatively.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("falha ao criar tokio runtime");
+    // SCHED_FIFO setup (best-effort): if granted, new threads created via
+    // `pthread_create` inherit FIFO scheduling — workers wake up immediately
+    // when their socket becomes readable (no runqueue wait).
+    let rt_granted = setup_sched_fifo();
+    let want_wakeup_only = env::var("RINHA_RT_MODE").as_deref() == Ok("wakeup");
+    let rt_wakeup_only = want_wakeup_only && rt_granted;
 
-    rt.block_on(server_loop(state));
+    eprintln!(
+        "fraud-api: RT mode = {} (prio {})",
+        if !rt_granted { "none/SCHED_OTHER" } else if rt_wakeup_only { "wakeup-only" } else { "all" },
+        WORKER_RT_PRIO
+    );
+
+    let state = Arc::new(AppState { index, mcc_risk, rt_wakeup_only });
+
+    serve_control(state);
 }
 
 // ── Control-socket server: receives accepted TCP fds from fraud-lb ────────────
 
-async fn server_loop(state: Arc<AppState>) {
+fn serve_control(state: Arc<AppState>) -> ! {
     let ctrl_path = env::var("CTRL_UDS").unwrap_or_else(|_| "/sockets/api1.ctrl".into());
 
     let _ = std::fs::remove_file(&ctrl_path);
@@ -107,9 +125,9 @@ async fn server_loop(state: Arc<AppState>) {
     // process lifetime. If it ever disconnects (crash/restart), we loop back
     // and accept a fresh connection — the same control socket file persists.
     loop {
-        match listener.accept().await {
+        match listener.accept() {
             Ok((lb_conn, _)) => {
-                recv_fds_loop(lb_conn, state.clone()).await;
+                recv_fds_loop(lb_conn, state.clone());
                 warn!("LB connection closed; awaiting reconnect");
             }
             Err(e) => warn!("ctrl accept error: {e}"),
@@ -117,28 +135,33 @@ async fn server_loop(state: Arc<AppState>) {
     }
 }
 
-/// Reads client fds from the LB control socket and spawns one task per fd.
-///
-/// Returns when the LB closes its side of the control socket — the outer
-/// `server_loop` will then accept a new LB connection on the same path.
-async fn recv_fds_loop(lb_conn: UnixStream, state: Arc<AppState>) {
+/// Reads client fds from the LB control socket and spawns one worker thread
+/// per fd. Returns when the LB closes its side of the control socket.
+fn recv_fds_loop(lb_conn: UnixStream, state: Arc<AppState>) {
+    let lb_fd = lb_conn.as_raw_fd();
     loop {
-        match recv_fd_async(&lb_conn).await {
+        match recv_fd_blocking(lb_fd) {
             Ok(fd) => {
                 // SAFETY: the LB just transferred ownership of `fd` to us via
                 // SCM_RIGHTS; the kernel guarantees it's a valid open file.
-                let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-                if let Err(e) = std_stream.set_nonblocking(true) {
-                    warn!("set_nonblocking failed: {e}");
-                    continue;
-                }
-                match TcpStream::from_std(std_stream) {
-                    Ok(tcp) => {
-                        let _ = tcp.set_nodelay(true);
-                        let state = state.clone();
-                        tokio::spawn(handle_conn(tcp, state));
-                    }
-                    Err(e) => warn!("TcpStream::from_std: {e}"),
+                let stream = unsafe { TcpStream::from_raw_fd(fd) };
+                // CRITICAL: LB is tokio (sets fd nonblocking on accept).
+                // SCM_RIGHTS passes the fd verbatim, so without flipping it
+                // back, std::net::TcpStream::read returns WouldBlock immediately
+                // and the connection drops — ~1000 phantom errors per k6 run.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_nodelay(true);
+
+                let st = state.clone();
+                let spawned = thread::Builder::new()
+                    .name("worker".into())
+                    .stack_size(WORKER_STACK_BYTES)
+                    .spawn(move || handle_conn(stream, st));
+
+                if let Err(e) = spawned {
+                    warn!("spawn worker failed: {e}");
+                    // `stream` was moved into the closure on success path; on
+                    // failure it's dropped here, closing the client fd.
                 }
             }
             Err(e) => {
@@ -149,30 +172,19 @@ async fn recv_fds_loop(lb_conn: UnixStream, state: Arc<AppState>) {
     }
 }
 
-/// Awaits readiness on the control socket and pulls one fd out of an
-/// `SCM_RIGHTS` ancillary message via blocking `recvmsg`.
-async fn recv_fd_async(stream: &UnixStream) -> std::io::Result<RawFd> {
-    loop {
-        stream.readable().await?;
-        match stream.try_io(Interest::READABLE, || recv_fd_sync(stream.as_raw_fd())) {
-            Ok(fd) => return Ok(fd),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-fn recv_fd_sync(socket_fd: RawFd) -> std::io::Result<RawFd> {
+/// Blocking `recvmsg` that returns the first fd from an `SCM_RIGHTS` ancillary
+/// message. Returns `ConnectionAborted` when the peer closed the control socket.
+fn recv_fd_blocking(ctrl_fd: RawFd) -> std::io::Result<RawFd> {
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
 
     let mut payload = [0u8; 16];
-    let mut iov = [std::io::IoSliceMut::new(&mut payload)];
+    let mut iov = [IoSliceMut::new(&mut payload)];
     let mut cmsg_space = nix::cmsg_space!([RawFd; 1]);
-    let msg = recvmsg::<()>(socket_fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty())
+    let msg = recvmsg::<()>(ctrl_fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty())
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
     if msg.bytes == 0 {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionAborted,
             "LB closed control socket",
         ));
     }
@@ -189,52 +201,76 @@ fn recv_fd_sync(socket_fd: RawFd) -> std::io::Result<RawFd> {
     Err(std::io::Error::other("no fd in SCM_RIGHTS cmsg"))
 }
 
-// ── Per-connection keepalive handler (now over TcpStream) ────────────────────
+// ── Per-connection blocking handler ──────────────────────────────────────────
 
-async fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) {
-    let mut accum: Vec<u8> = Vec::with_capacity(4096);
-    let mut chunk_buf = [0u8; 4096]; // stack buffer — evita malloc por chunk
+fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) {
+    let mut buf = [0u8; READ_BUF_SIZE];
+    let mut buf_pos: usize = 0;
 
     loop {
-        accum.clear();
-
-        // ── Accumulate complete request ────────────────────────────────────
-        let (header_end, content_length, is_close) = loop {
-            let cap = 4096usize.saturating_sub(accum.len()).max(512);
-            let read_buf = &mut chunk_buf[..cap];
-            let n = match stream.read(read_buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            accum.extend_from_slice(&chunk_buf[..n]);
-
-            match parse_head(&accum) {
-                Some(x) => break x,
-                None if accum.len() > 8192 => return,
-                None => continue,
-            }
+        // Blocking read — the kernel wakes us when bytes are available. With
+        // SCHED_FIFO this wakeup is preemptive and skips the runqueue wait.
+        let n = match stream.read(&mut buf[buf_pos..]) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return,
         };
 
-        // ── Read remaining body bytes ──────────────────────────────────────
-        let body_start = header_end;
-        let body_end   = body_start + content_length;
-
-        while accum.len() < body_end {
-            let need  = body_end - accum.len();
-            let read_buf = &mut chunk_buf[..need.min(4096)];
-            let n = match stream.read(read_buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            accum.extend_from_slice(&chunk_buf[..n]);
+        // Wakeup-only mode: drop to SCHED_OTHER now that we've won the wakeup
+        // race; compute+send won't outrank softirqs or the test client.
+        if state.rt_wakeup_only {
+            worker_set_rt(false);
         }
 
-        // ── Dispatch ──────────────────────────────────────────────────────
-        let resp: &'static [u8] = dispatch(&accum, body_start, body_end, &state);
+        buf_pos += n;
 
-        // ── Write response ────────────────────────────────────────────────
-        if stream.write_all(resp).await.is_err() || is_close {
-            return;
+        // Drain every complete request currently in `buf`. HTTP/1.1 pipelining
+        // can deliver multiple in one read; serve them in order.
+        let mut drained_at_least_one = false;
+        loop {
+            let Some((header_end, content_length, is_close)) = parse_head(&buf[..buf_pos]) else {
+                if buf_pos >= READ_BUF_SIZE {
+                    return; // oversized header → drop the connection
+                }
+                break;
+            };
+            let body_end = header_end + content_length;
+
+            // Read remaining body bytes if not all in buffer yet.
+            while buf_pos < body_end {
+                if body_end > READ_BUF_SIZE {
+                    return; // body bigger than buffer — drop
+                }
+                let n = match stream.read(&mut buf[buf_pos..body_end]) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                buf_pos += n;
+            }
+
+            let resp = dispatch(&buf[..body_end], header_end, body_end, &state);
+            if stream.write_all(resp).is_err() {
+                return;
+            }
+            drained_at_least_one = true;
+            if is_close {
+                return;
+            }
+
+            let leftover = buf_pos - body_end;
+            if leftover > 0 {
+                buf.copy_within(body_end..body_end + leftover, 0);
+            }
+            buf_pos = leftover;
+        }
+
+        let _ = drained_at_least_one;
+
+        // Restore FIFO before blocking in recv again — the next request's
+        // wakeup needs to skip the runqueue too.
+        if state.rt_wakeup_only {
+            worker_set_rt(true);
         }
     }
 }
@@ -293,6 +329,77 @@ fn score_body(body: &[u8], state: &AppState) -> &'static [u8] {
     };
 
     HTTP_FRAUD[idx]
+}
+
+// ── Realtime scheduling helpers ───────────────────────────────────────────────
+
+/// Sets SCHED_FIFO on the calling thread (main). Returns true if granted.
+///
+/// Subsequent `thread::spawn` calls inherit scheduling from the parent (default
+/// `PTHREAD_INHERIT_SCHED`), so worker threads will also be SCHED_FIFO.
+///
+/// Tries libc wrapper first, falls back to a direct `syscall` — some musl
+/// builds + Docker seccomp combos reject the wrapper but accept the raw call.
+fn setup_sched_fifo() -> bool {
+    unsafe {
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = WORKER_RT_PRIO;
+        let rc = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+        if rc == 0 {
+            return true;
+        }
+        let err1 = *libc::__errno_location();
+
+        // Some setups (musl static + Docker seccomp default) reject the libc
+        // wrapper but accept the raw syscall. SYS_sched_setscheduler = 144 on
+        // x86_64. Args: pid=0 (self), policy=SCHED_FIFO=1, param ptr.
+        let rc2 = libc::syscall(
+            libc::SYS_sched_setscheduler,
+            0i32,
+            libc::SCHED_FIFO,
+            &param as *const _,
+        );
+        if rc2 == 0 {
+            eprintln!("fraud-api: SCHED_FIFO via raw syscall (wrapper errno {err1})");
+            return true;
+        }
+        let err2 = *libc::__errno_location();
+        eprintln!("fraud-api: SCHED_FIFO denied (wrapper errno {err1}, syscall errno {err2})");
+        false
+    }
+}
+
+/// Switches the *calling thread* between SCHED_FIFO (on) and SCHED_OTHER (off).
+///
+/// Used in wakeup-only mode: workers spend `recv` blocked at SCHED_FIFO so the
+/// kernel wakes them preemptively, then switch to SCHED_OTHER for compute+send.
+/// Uses raw syscall — see `setup_sched_fifo` for the libc-wrapper rationale.
+fn worker_set_rt(on: bool) {
+    unsafe {
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = if on { WORKER_RT_PRIO } else { 0 };
+        let policy = if on { libc::SCHED_FIFO } else { libc::SCHED_OTHER };
+        let _ = libc::syscall(
+            libc::SYS_sched_setscheduler,
+            0i32,
+            policy,
+            &param as *const _,
+        );
+    }
+}
+
+/// Pins this process (and inherited worker threads) to the CPU specified by
+/// `RINHA_CPU` (e.g. "0", "2"). No-op if the env var is missing or invalid.
+fn set_cpu_affinity_from_env() {
+    let Ok(cpu_str) = env::var("RINHA_CPU") else { return };
+    let Ok(cpu_id) = cpu_str.trim().parse::<usize>() else { return };
+
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu_id, &mut set);
+        let _ = libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set);
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
