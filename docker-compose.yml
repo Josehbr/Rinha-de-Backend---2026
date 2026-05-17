@@ -2,7 +2,7 @@ services:
   lb:
     # The image bundles both fraud-api (default CMD) and fraud-lb. We override
     # the command here so the LB process runs instead of the API.
-    image: josehbr/fraud-api:v9
+    image: josehbr/fraud-api:v8
     command: ["./fraud-lb"]
     environment:
       - RUST_LOG=warn
@@ -24,7 +24,7 @@ services:
           memory: "20MB"
 
   api1:
-    image: josehbr/fraud-api:v9
+    image: josehbr/fraud-api:v8
     restart: on-failure
     volumes:
       - sockets:/sockets
@@ -52,7 +52,7 @@ services:
           memory: "165MB"
 
   api2:
-    image: josehbr/fraud-api:v9
+    image: josehbr/fraud-api:v8
     restart: on-failure
     volumes:
       - sockets:/sockets
