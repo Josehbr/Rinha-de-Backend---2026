@@ -31,20 +31,9 @@ services:
     environment:
       - RUST_LOG=warn
       - CTRL_UDS=/sockets/api1.ctrl
-      # SCHED_FIFO wakeup-only: workers spend recv() at FIFO so the kernel
-      # wakes them preemptively (skips runqueue wait), then switch to
-      # SCHED_OTHER for compute+send so we don't outrank softirqs.
-      - RINHA_RT_MODE=wakeup
-      # Pin worker threads to a single core to reduce cross-core cache misses.
-      - RINHA_CPU=0
-    cap_add:
-      # Required for sched_setscheduler(SCHED_FIFO). Best-effort: if the Rinha
-      # bot strips this, the API still runs (silent fallback to SCHED_OTHER).
-      - SYS_NICE
-    security_opt:
-      # Default Docker seccomp can reject sched_setscheduler from a musl
-      # static binary; `unconfined` is what Ronie #2 (p99 0.86ms) uses too.
-      - seccomp:unconfined
+    # cap_add/security_opt removed — Rinha bot rejects "adding capabilities".
+    # The binary calls sched_setscheduler(SCHED_FIFO) best-effort; on denial it
+    # falls back silently to SCHED_OTHER. Pthread blocking architecture remains.
     ulimits:
       # Allow mlockall + MAP_POPULATE on the 84MB index without EAGAIN.
       memlock:
@@ -70,12 +59,6 @@ services:
     environment:
       - RUST_LOG=warn
       - CTRL_UDS=/sockets/api2.ctrl
-      - RINHA_RT_MODE=wakeup
-      - RINHA_CPU=2
-    cap_add:
-      - SYS_NICE
-    security_opt:
-      - seccomp:unconfined
     ulimits:
       memlock:
         soft: -1
@@ -101,5 +84,5 @@ volumes:
 
 # Totais: 1.0 CPU / 350 MB — dentro do limite da Rinha
 #   lb   : 0.16 CPU /  20 MB  (TCP→UDS via SCM_RIGHTS, sem parse de HTTP)
-#   api1 : 0.42 CPU / 165 MB  (pthread blocking + SCHED_FIFO wakeup-only)
-#   api2 : 0.42 CPU / 165 MB  (pthread blocking + SCHED_FIFO wakeup-only)
+#   api1 : 0.42 CPU / 165 MB  (pthread blocking, SCHED_FIFO best-effort)
+#   api2 : 0.42 CPU / 165 MB  (pthread blocking, SCHED_FIFO best-effort)
